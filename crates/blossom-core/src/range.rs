@@ -8,8 +8,11 @@ pub struct ByteRange {
 
 impl ByteRange {
     /// Number of bytes covered, which is the `Content-Length` of a 206.
+    ///
+    /// Saturating: the fields are public and a hand-built range can have
+    /// `end` below `start` or at `u64::MAX`.
     pub fn len(&self) -> u64 {
-        self.end - self.start + 1
+        self.end.saturating_sub(self.start).saturating_add(1)
     }
 
     /// Always false: a constructed range covers at least one byte.
@@ -42,6 +45,8 @@ pub enum RangeOutcome {
 /// Parses a `Range` header value (RFC 7233 section 3) against `total_len`.
 ///
 /// Handles `bytes=start-end`, `bytes=start-`, and the suffix form `bytes=-N`.
+/// The unit is `bytes`, matched case-insensitively; a header naming any other
+/// range unit is ignored (RFC 7233 section 3.1), as is a blank header value.
 /// Multiple ranges are not supported by this server and are reported as
 /// `Malformed` rather than silently truncated.
 pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
@@ -52,9 +57,15 @@ pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
     if value.is_empty() {
         return RangeOutcome::Full;
     }
-    let Some(spec) = value.strip_prefix("bytes=") else {
+    // RFC 7233 section 3.1: an origin server MUST ignore a Range header with a
+    // range unit it does not understand. `bytes-unit = "bytes"` (section 2.1)
+    // and ABNF tokens are case-insensitive (RFC 5234 section 2.3).
+    let Some((unit, spec)) = value.split_once('=') else {
         return RangeOutcome::Malformed;
     };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return RangeOutcome::Full;
+    }
     // This server answers a single range only; a list is not silently truncated.
     if spec.contains(',') {
         return RangeOutcome::Malformed;
@@ -63,18 +74,29 @@ pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
         return RangeOutcome::Malformed;
     };
     if start_s.is_empty() {
-        let Ok(suffix) = end_s.parse::<u64>() else {
+        // suffix-byte-range-spec: `-` 1*DIGIT, the last N bytes.
+        if end_s.is_empty() || !end_s.bytes().all(|b| b.is_ascii_digit()) {
             return RangeOutcome::Malformed;
-        };
-        if suffix == 0 || total_len == 0 {
+        }
+        if total_len == 0 {
             return RangeOutcome::Unsatisfiable;
         }
-        return RangeOutcome::Partial(ByteRange {
-            start: total_len.saturating_sub(suffix),
-            end: total_len - 1,
-        });
+        return match end_s.parse::<u64>() {
+            Ok(0) => RangeOutcome::Unsatisfiable,
+            Ok(suffix) => RangeOutcome::Partial(ByteRange {
+                start: total_len.saturating_sub(suffix),
+                end: total_len - 1,
+            }),
+            // RFC 7233 section 2.1: a suffix-length >= the representation
+            // length selects the whole representation. A value that overflows
+            // u64 is certainly >= `total_len`, so it is not malformed.
+            Err(_) => RangeOutcome::Partial(ByteRange {
+                start: 0,
+                end: total_len - 1,
+            }),
+        };
     }
-    let Ok(start) = start_s.parse::<u64>() else {
+    let Some(start) = parse_digits(start_s) else {
         return RangeOutcome::Malformed;
     };
     if total_len == 0 || start >= total_len {
@@ -86,7 +108,7 @@ pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
             end: total_len - 1,
         });
     }
-    let Ok(end) = end_s.parse::<u64>() else {
+    let Some(end) = parse_digits(end_s) else {
         return RangeOutcome::Malformed;
     };
     if end < start {
@@ -94,6 +116,17 @@ pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
     }
     let end = end.min(total_len - 1);
     RangeOutcome::Partial(ByteRange { start, end })
+}
+
+/// Parses `1*DIGIT` (RFC 7233 section 2.1) as `u64`.
+///
+/// Digits are validated before parsing: `str::parse::<u64>` would otherwise
+/// accept a leading `+`, which the ABNF does not permit.
+fn parse_digits(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok()
 }
 
 #[cfg(test)]
@@ -175,10 +208,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_unit_is_malformed() {
+    fn unknown_unit_is_ignored() {
+        // RFC 7233 section 3.1: ignore a Range header with an unfamiliar unit.
+        assert_eq!(parse_range(Some("items=0-99"), 1000), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn bytes_unit_is_case_insensitive() {
+        // RFC 5234 section 2.3: ABNF literal tokens are case-insensitive.
         assert_eq!(
-            parse_range(Some("items=0-99"), 1000),
-            RangeOutcome::Malformed
+            parse_range(Some("Bytes=0-99"), 1000),
+            RangeOutcome::Partial(ByteRange { start: 0, end: 99 })
         );
     }
 
@@ -189,6 +229,29 @@ mod tests {
             RangeOutcome::Malformed
         );
         assert_eq!(parse_range(Some("bytes="), 1000), RangeOutcome::Malformed);
+    }
+
+    #[test]
+    fn leading_plus_is_malformed() {
+        // first-byte-pos and suffix-length are 1*DIGIT; `+` is not a digit.
+        assert_eq!(
+            parse_range(Some("bytes=+5-89"), 1000),
+            RangeOutcome::Malformed
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-+5"), 1000),
+            RangeOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn suffix_length_larger_than_u64_selects_whole_blob() {
+        // A suffix-length >= the representation length selects the whole blob
+        // (RFC 7233 section 2.1); overflowing u64 is therefore not malformed.
+        assert_eq!(
+            parse_range(Some("bytes=-99999999999999999999"), 1000),
+            RangeOutcome::Partial(ByteRange { start: 0, end: 999 })
+        );
     }
 
     #[test]
@@ -203,6 +266,21 @@ mod tests {
         assert_eq!(
             parse_range(Some("bytes=-5000"), 1000),
             RangeOutcome::Partial(ByteRange { start: 0, end: 999 })
+        );
+    }
+
+    #[test]
+    fn suffix_one_selects_final_byte() {
+        assert_eq!(
+            parse_range(Some("bytes=-1"), 1000),
+            RangeOutcome::Partial(ByteRange {
+                start: 999,
+                end: 999
+            })
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-1"), 1),
+            RangeOutcome::Partial(ByteRange { start: 0, end: 0 })
         );
     }
 
@@ -229,6 +307,18 @@ mod tests {
         };
         assert_eq!(range, ByteRange { start: 0, end: 0 });
         assert_eq!(range.len(), 1);
+    }
+
+    #[test]
+    fn hand_built_range_len_is_saturating() {
+        // The fields are public; a reversed range must not panic or wrap.
+        let reversed = ByteRange { start: 10, end: 0 };
+        assert_eq!(reversed.len(), 1);
+        let full = ByteRange {
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(full.len(), u64::MAX);
     }
 
     #[test]

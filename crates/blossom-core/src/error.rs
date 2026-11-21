@@ -6,9 +6,6 @@ pub enum CoreError {
     /// Not exactly 64 lowercase hex characters.
     #[error("invalid sha256: expected 64 lowercase hex characters")]
     InvalidHash,
-    /// A MIME type that could not be normalized.
-    #[error("invalid mime type: {0}")]
-    InvalidMime(String),
 }
 
 /// Errors from BUD-11 authorization token validation.
