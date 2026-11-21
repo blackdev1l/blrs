@@ -12,6 +12,10 @@ use crate::sha256::Sha256;
 pub enum Action {
     Get,
     Upload,
+    /// BUD-11 rule 4 additionally requires that, for a list operation, the
+    /// token `pubkey` equals the pubkey named by the request path. Core cannot
+    /// express that constraint, so the caller must compare
+    /// [`AuthorizedUser::pubkey`] against the path segment itself.
     List,
     Delete,
     Media,
@@ -30,6 +34,11 @@ impl Action {
     }
 
     /// Parses a `t` tag verb.
+    ///
+    /// This is for client and error-reporting use only. The server must derive
+    /// [`VerifyContext::action`] from the target endpoint, never from the
+    /// token's own `t` tag: validating the tag against itself would make
+    /// BUD-11 rule 4 a tautology.
     pub fn from_verb(verb: &str) -> Option<Self> {
         match verb {
             "get" => Some(Action::Get),
@@ -39,6 +48,14 @@ impl Action {
             "media" => Some(Action::Media),
             _ => None,
         }
+    }
+
+    /// Whether the BUD-11 endpoint table mandates an `x` tag for this action.
+    ///
+    /// `Upload`, `Delete`, and `Media` name a blob hash in the request, so an
+    /// `x` tag is required; `Get` and `List` carry it only optionally.
+    pub fn requires_x(self) -> bool {
+        matches!(self, Action::Upload | Action::Delete | Action::Media)
     }
 }
 
@@ -83,15 +100,44 @@ pub struct VerifyContext<'a> {
     /// The blob hash implied by the endpoint, when it has one.
     pub blob: Option<&'a Sha256>,
     /// Whether at least one matching `x` tag is required (BUD-11 table).
-    pub require_x: bool,
+    ///
+    /// Derived from [`Action::requires_x`] by [`VerifyContext::new`] and kept
+    /// private so a caller cannot drop a requirement the endpoint mandates.
+    require_x: bool,
     /// Current unix time, injected so expiry is testable.
     pub now: i64,
+}
+
+impl<'a> VerifyContext<'a> {
+    /// Builds a context for `action`, deriving `require_x` from the BUD-11
+    /// endpoint table via [`Action::requires_x`].
+    pub fn new(action: Action, host: &'a str, blob: Option<&'a Sha256>, now: i64) -> Self {
+        Self {
+            action,
+            host,
+            blob,
+            require_x: action.requires_x(),
+            now,
+        }
+    }
+
+    /// Whether at least one matching `x` tag is required for this context.
+    pub fn require_x(&self) -> bool {
+        self.require_x
+    }
 }
 
 /// The verified identity behind a token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedUser {
-    pub pubkey: String,
+    pubkey: String,
+}
+
+impl AuthorizedUser {
+    /// The verified signer pubkey, as lowercase hex.
+    pub fn pubkey(&self) -> &str {
+        &self.pubkey
+    }
 }
 
 impl AuthToken {
@@ -122,8 +168,9 @@ impl AuthToken {
     /// 2. `created_at` is in the past
     /// 3. `expiration` tag is present and in the future
     /// 4. a `t` tag matches the endpoint's action
-    /// 5. if any `server` tag is present, this host is among them
-    /// 6. if the endpoint requires it, an `x` tag matches the blob hash
+    /// 5. if any `server` tag is present, this host is among its values
+    /// 6. if an `x` tag is present it names the endpoint's blob hash; when the
+    ///    endpoint mandates `x`, at least one such tag must be present
     pub fn verify(&self, ctx: VerifyContext<'_>) -> Result<AuthorizedUser, AuthError> {
         verify_signature(&self.event)?;
 
@@ -147,20 +194,30 @@ impl AuthToken {
         if !event.tag_values("t").contains(&verb) {
             return Err(AuthError::WrongVerb);
         }
-        let servers = event.tag_values("server");
-        if !servers.is_empty() && !servers.iter().any(|s| s.eq_ignore_ascii_case(ctx.host)) {
+        // Rule 5 is unconditional on tag *presence*: a tag `["server"]` with
+        // no value carries no host to match, so it must still fail here.
+        let has_server_tag = event
+            .tags
+            .iter()
+            .any(|tag| tag.first().is_some_and(|k| k == "server"));
+        if has_server_tag
+            && !event
+                .tag_values("server")
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(ctx.host))
+        {
             return Err(AuthError::ServerMismatch);
         }
-        if ctx.require_x {
-            let blob = ctx.blob.ok_or(AuthError::MissingXTag)?;
-            let expected = blob.to_hex();
-            let x_values = event.tag_values("x");
-            if x_values.is_empty() {
+        if let Some(blob) = ctx.blob {
+            let xs = event.tag_values("x");
+            if ctx.require_x && xs.is_empty() {
                 return Err(AuthError::MissingXTag);
             }
-            if !x_values.contains(&expected.as_str()) {
+            if !xs.is_empty() && !xs.contains(&blob.to_hex().as_str()) {
                 return Err(AuthError::XTagMismatch);
             }
+        } else if ctx.require_x {
+            return Err(AuthError::MissingXTag);
         }
         Ok(AuthorizedUser {
             pubkey: event.pubkey.clone(),
@@ -232,6 +289,10 @@ mod tests {
         vec![name.to_string(), value.to_string()]
     }
 
+    fn tag_without_value(name: &str) -> Vec<String> {
+        vec![name.to_string()]
+    }
+
     /// The worked example from `docs/buds/11.md`.
     ///
     /// The spec renders only three tags (`t`, `expiration`, `x`), but the `id`
@@ -296,14 +357,24 @@ mod tests {
         ]
     }
 
+    /// Builds an event whose `id` matches its (possibly malformed) `pubkey`,
+    /// so signature verification reaches the pubkey decode step.
+    fn event_with_raw_pubkey(pubkey: &str) -> NostrEvent {
+        let mut event = NostrEvent {
+            id: String::new(),
+            pubkey: pubkey.to_string(),
+            created_at: NOW - 100,
+            kind: 24242,
+            tags: upload_tags(),
+            content: "Upload Blob".to_string(),
+            sig: "00".repeat(64),
+        };
+        event.id = event_id(&event).unwrap();
+        event
+    }
+
     fn upload_ctx(blob: &Sha256) -> VerifyContext<'_> {
-        VerifyContext {
-            action: Action::Upload,
-            host: HOST,
-            blob: Some(blob),
-            require_x: true,
-            now: NOW,
-        }
+        VerifyContext::new(Action::Upload, HOST, Some(blob), NOW)
     }
 
     // ---- event_id --------------------------------------------------------
@@ -404,7 +475,7 @@ mod tests {
         let event = signed_event(24242, NOW - 100, upload_tags(), "Upload Blob");
         let blob = Sha256::parse(X_HEX).unwrap();
         assert_eq!(
-            token(event).verify(upload_ctx(&blob)).unwrap().pubkey,
+            token(event).verify(upload_ctx(&blob)).unwrap().pubkey(),
             BUD_PUBKEY
         );
     }
@@ -418,11 +489,8 @@ mod tests {
         ];
         let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
         let blob = Sha256::parse(X_HEX).unwrap();
-        let ctx = VerifyContext {
-            host: "somewhere.else",
-            ..upload_ctx(&blob)
-        };
-        assert_eq!(token(event).verify(ctx).unwrap().pubkey, BUD_PUBKEY);
+        let ctx = VerifyContext::new(Action::Upload, "somewhere.else", Some(&blob), NOW);
+        assert_eq!(token(event).verify(ctx).unwrap().pubkey(), BUD_PUBKEY);
     }
 
     #[test]
@@ -436,7 +504,7 @@ mod tests {
         let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
         let blob = Sha256::parse(X_HEX).unwrap();
         assert_eq!(
-            token(event).verify(upload_ctx(&blob)).unwrap().pubkey,
+            token(event).verify(upload_ctx(&blob)).unwrap().pubkey(),
             BUD_PUBKEY
         );
     }
@@ -449,14 +517,8 @@ mod tests {
             tag("expiration", &(NOW + 3600).to_string()),
         ];
         let event = signed_event(24242, NOW - 100, tags, "Get blob");
-        let ctx = VerifyContext {
-            action: Action::Get,
-            host: HOST,
-            blob: None,
-            require_x: false,
-            now: NOW,
-        };
-        assert_eq!(token(event).verify(ctx).unwrap().pubkey, BUD_PUBKEY);
+        let ctx = VerifyContext::new(Action::Get, HOST, None, NOW);
+        assert_eq!(token(event).verify(ctx).unwrap().pubkey(), BUD_PUBKEY);
     }
 
     // ---- verify: one test per BUD-11 rule --------------------------------
@@ -579,10 +641,7 @@ mod tests {
         let mut event = bud_event();
         event.content = "Upload Blob".to_string();
         let blob = Sha256::parse(X_HEX).unwrap();
-        let ctx = VerifyContext {
-            host: HOST,
-            ..upload_ctx(&blob)
-        };
+        let ctx = VerifyContext::new(Action::Upload, HOST, Some(&blob), NOW);
         assert_eq!(token(event).verify(ctx), Err(AuthError::BadEventId));
     }
 
@@ -596,5 +655,197 @@ mod tests {
             token(event).verify(upload_ctx(&blob)),
             Err(AuthError::BadSignature)
         );
+    }
+
+    // ---- verify: BUD-11 rule 5 (server) scoping --------------------------
+
+    #[test]
+    fn verify_rejects_valueless_server_tag() {
+        // BUD-11 rule 5 keys on tag *presence*: `["server"]` carries no host,
+        // so it cannot match and must not fall through as a global token.
+        let tags = vec![
+            tag("t", "upload"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", X_HEX),
+            tag_without_value("server"),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        assert_eq!(
+            token(event).verify(upload_ctx(&blob)),
+            Err(AuthError::ServerMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_accepts_one_of_several_server_tags() {
+        let tags = vec![
+            tag("t", "upload"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", X_HEX),
+            tag("server", "other.example.com"),
+            tag("server", HOST),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        assert_eq!(
+            token(event).verify(upload_ctx(&blob)).unwrap().pubkey(),
+            BUD_PUBKEY
+        );
+    }
+
+    #[test]
+    fn verify_server_tag_must_match_whole_host() {
+        // `example.com` is a mere suffix of `cdn.example.com`; scoping must not
+        // be fooled by a substring match.
+        let tags = vec![
+            tag("t", "upload"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", X_HEX),
+            tag("server", "example.com"),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        assert_eq!(
+            token(event).verify(upload_ctx(&blob)),
+            Err(AuthError::ServerMismatch)
+        );
+    }
+
+    // ---- verify: `x` tags on endpoints where they are optional -----------
+
+    #[test]
+    fn verify_get_rejects_x_tag_mismatch() {
+        // BUD-11: on GET/HEAD `x` is optional, but when present it must name
+        // the requested blob.
+        let other = "11".repeat(32);
+        let tags = vec![
+            tag("t", "get"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", &other),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Get blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        let ctx = VerifyContext::new(Action::Get, HOST, Some(&blob), NOW);
+        assert_eq!(token(event).verify(ctx), Err(AuthError::XTagMismatch));
+    }
+
+    #[test]
+    fn verify_get_accepts_matching_x_tag() {
+        let tags = vec![
+            tag("t", "get"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", X_HEX),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Get blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        let ctx = VerifyContext::new(Action::Get, HOST, Some(&blob), NOW);
+        assert_eq!(token(event).verify(ctx).unwrap().pubkey(), BUD_PUBKEY);
+    }
+
+    #[test]
+    fn verify_accepts_one_of_several_x_tags() {
+        let other = "22".repeat(32);
+        let tags = vec![
+            tag("t", "get"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", &other),
+            tag("x", X_HEX),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Get blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        let ctx = VerifyContext::new(Action::Get, HOST, Some(&blob), NOW);
+        assert_eq!(token(event).verify(ctx).unwrap().pubkey(), BUD_PUBKEY);
+    }
+
+    #[test]
+    fn verify_missing_x_without_blob_is_missing_x_tag() {
+        // `require_x` with no blob to match is always MissingXTag.
+        let tags = vec![
+            tag("t", "upload"),
+            tag("expiration", &(NOW + 3600).to_string()),
+            tag("x", X_HEX),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
+        let ctx = VerifyContext::new(Action::Upload, HOST, None, NOW);
+        assert_eq!(token(event).verify(ctx), Err(AuthError::MissingXTag));
+    }
+
+    // ---- endpoint table is encoded in the type ---------------------------
+
+    #[test]
+    fn action_requires_x_truth_table() {
+        assert!(Action::Upload.requires_x());
+        assert!(Action::Delete.requires_x());
+        assert!(Action::Media.requires_x());
+        assert!(!Action::Get.requires_x());
+        assert!(!Action::List.requires_x());
+    }
+
+    #[test]
+    fn verify_context_new_derives_require_x_from_action() {
+        let blob = Sha256::parse(X_HEX).unwrap();
+        assert!(VerifyContext::new(Action::Upload, HOST, Some(&blob), NOW).require_x());
+        assert!(!VerifyContext::new(Action::Get, HOST, Some(&blob), NOW).require_x());
+    }
+
+    // ---- verify: malformed signature material ----------------------------
+
+    #[test]
+    fn verify_rejects_wrong_length_signature() {
+        let mut event = signed_event(24242, NOW - 100, upload_tags(), "Upload Blob");
+        event.sig = "ab".to_string();
+        assert_eq!(verify_signature(&event), Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn verify_rejects_non_hex_signature() {
+        let mut event = signed_event(24242, NOW - 100, upload_tags(), "Upload Blob");
+        event.sig = "zz".repeat(32);
+        assert_eq!(verify_signature(&event), Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_length_pubkey() {
+        let event = event_with_raw_pubkey("ab");
+        assert_eq!(verify_signature(&event), Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn verify_rejects_non_hex_pubkey() {
+        let event = event_with_raw_pubkey(&"zz".repeat(32));
+        assert_eq!(verify_signature(&event), Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn verify_rejects_non_numeric_expiration() {
+        let tags = vec![
+            tag("t", "upload"),
+            tag("expiration", "soon"),
+            tag("x", X_HEX),
+            tag("server", HOST),
+        ];
+        let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        assert_eq!(
+            token(event).verify(upload_ctx(&blob)),
+            Err(AuthError::Expired)
+        );
+    }
+
+    // ---- Action verb parsing ---------------------------------------------
+
+    #[test]
+    fn action_verb_round_trips_and_rejects_garbage() {
+        for action in [
+            Action::Get,
+            Action::Upload,
+            Action::List,
+            Action::Delete,
+            Action::Media,
+        ] {
+            assert_eq!(Action::from_verb(action.verb()), Some(action));
+        }
+        assert_eq!(Action::from_verb("garbage"), None);
     }
 }
