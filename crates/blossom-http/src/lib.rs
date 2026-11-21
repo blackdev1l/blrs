@@ -31,9 +31,33 @@ pub mod state;
 pub use config::Config;
 pub use error::HttpError;
 pub use router::router;
-pub use state::AppState;
+pub use state::{AppState, SystemClock};
+
+use std::sync::Arc;
+
+use blossom_store::{FsBlobStore, StoreConfig};
+use tracing_subscriber::EnvFilter;
 
 /// Boots the server from the environment.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    todo!("lane C: tracing + config + FsBlobStore::open + bind + axum::serve")
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::from_env()?;
+    let store = FsBlobStore::open(StoreConfig {
+        data_dir: config.data_dir.clone(),
+        max_blob_size: config.max_blob_size,
+    })
+    .await?;
+
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let bound = listener.local_addr()?;
+    tracing::info!(address = %bound, "blossom server listening");
+
+    let state = AppState::new(Arc::new(store), Arc::new(config), Arc::new(SystemClock));
+    axum::serve(listener, router(state)).await?;
+    Ok(())
 }
