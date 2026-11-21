@@ -31,5 +31,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.9"
 
 [dev-dependencies]
+# Integration tests build real BUD-11 tokens: sign the kind-24242 event with a
+# test key, then base64url-encode it. All three crates are already in the
+# workspace lock via blossom-core, so this adds no new transitive versions.
+base64 = "0.23.1"
+hex = "0.4.3"
+secp256k1 = { version = "0.33.1", features = ["std", "rand"] }
+sha2 = "0.10.9"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
