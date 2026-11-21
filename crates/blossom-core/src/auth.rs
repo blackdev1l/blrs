@@ -57,6 +57,16 @@ impl Action {
     pub fn requires_x(self) -> bool {
         matches!(self, Action::Upload | Action::Delete | Action::Media)
     }
+
+    /// Whether the BUD-11 endpoint table names a blob hash for this action.
+    ///
+    /// Every endpoint except `GET /list/<pubkey>` carries one, so `blob` must
+    /// be `Some` for those. [`VerifyContext::new`] asserts that in debug
+    /// builds, so an endpoint wired up without its hash fails loudly instead of
+    /// silently skipping `x` scoping.
+    pub fn implies_blob(self) -> bool {
+        !matches!(self, Action::List)
+    }
 }
 
 /// A NIP-01 nostr event, as carried inside an authorization token.
@@ -98,32 +108,39 @@ pub struct VerifyContext<'a> {
     /// This server's domain name, matched against `server` tags (e.g. `cdn.example.com`).
     pub host: &'a str,
     /// The blob hash implied by the endpoint, when it has one.
-    pub blob: Option<&'a Sha256>,
-    /// Whether at least one matching `x` tag is required (BUD-11 table).
     ///
-    /// Derived from [`Action::requires_x`] by [`VerifyContext::new`] and kept
-    /// private so a caller cannot drop a requirement the endpoint mandates.
-    require_x: bool,
+    /// Must be `Some` for every action except [`Action::List`]; [`VerifyContext::new`]
+    /// asserts this in debug builds.
+    pub blob: Option<&'a Sha256>,
     /// Current unix time, injected so expiry is testable.
     pub now: i64,
 }
 
 impl<'a> VerifyContext<'a> {
-    /// Builds a context for `action`, deriving `require_x` from the BUD-11
-    /// endpoint table via [`Action::requires_x`].
+    /// Builds a context for `action`.
+    ///
+    /// There is deliberately no `require_x` parameter and no stored flag: the
+    /// BUD-11 endpoint table is consulted through [`Action::requires_x`] at
+    /// validation time. A caller therefore cannot drop a requirement the
+    /// endpoint mandates, and there is no second copy of the flag to fall out
+    /// of step with `action`.
     pub fn new(action: Action, host: &'a str, blob: Option<&'a Sha256>, now: i64) -> Self {
+        debug_assert_eq!(
+            blob.is_some(),
+            action.implies_blob(),
+            "VerifyContext::new: {action:?} must supply a blob hash iff the endpoint implies one"
+        );
         Self {
             action,
             host,
             blob,
-            require_x: action.requires_x(),
             now,
         }
     }
 
     /// Whether at least one matching `x` tag is required for this context.
     pub fn require_x(&self) -> bool {
-        self.require_x
+        self.action.requires_x()
     }
 }
 
@@ -148,8 +165,10 @@ impl AuthToken {
         if !scheme.eq_ignore_ascii_case("Nostr") {
             return Err(AuthError::BadScheme);
         }
+        // RFC 7235 section 2.1 allows one or more spaces between the scheme and
+        // the token, so only the first space is significant.
         let bytes = URL_SAFE_NO_PAD
-            .decode(token)
+            .decode(token.trim_start())
             .map_err(|_| AuthError::BadBase64)?;
         let event: NostrEvent = serde_json::from_slice(&bytes).map_err(|_| AuthError::BadJson)?;
         Ok(Self { event })
@@ -210,13 +229,23 @@ impl AuthToken {
         }
         if let Some(blob) = ctx.blob {
             let xs = event.tag_values("x");
-            if ctx.require_x && xs.is_empty() {
+            if ctx.require_x() && xs.is_empty() {
                 return Err(AuthError::MissingXTag);
+            }
+            // Same asymmetry as rule 5: a tag `["x"]` with no value names no
+            // hash, so it cannot scope the token. Fail closed rather than
+            // reading it as "unscoped".
+            let has_x_tag = event
+                .tags
+                .iter()
+                .any(|tag| tag.first().is_some_and(|k| k == "x"));
+            if has_x_tag && xs.is_empty() {
+                return Err(AuthError::XTagMismatch);
             }
             if !xs.is_empty() && !xs.contains(&blob.to_hex().as_str()) {
                 return Err(AuthError::XTagMismatch);
             }
-        } else if ctx.require_x {
+        } else if ctx.require_x() {
             return Err(AuthError::MissingXTag);
         }
         Ok(AuthorizedUser {
@@ -517,7 +546,12 @@ mod tests {
             tag("expiration", &(NOW + 3600).to_string()),
         ];
         let event = signed_event(24242, NOW - 100, tags, "Get blob");
-        let ctx = VerifyContext::new(Action::Get, HOST, None, NOW);
+        // Supply the blob so this exercises "an optional `x` tag may be
+        // absent" rather than the `blob == None` branch. With `None` the
+        // `!xs.is_empty()` guard above could be deleted with the suite staying
+        // green, which is exactly the property this test exists to protect.
+        let blob = Sha256::parse(X_HEX).unwrap();
+        let ctx = VerifyContext::new(Action::Get, HOST, Some(&blob), NOW);
         assert_eq!(token(event).verify(ctx).unwrap().pubkey(), BUD_PUBKEY);
     }
 
@@ -759,16 +793,28 @@ mod tests {
     }
 
     #[test]
-    fn verify_missing_x_without_blob_is_missing_x_tag() {
-        // `require_x` with no blob to match is always MissingXTag.
-        let tags = vec![
-            tag("t", "upload"),
+    #[should_panic(expected = "must supply a blob hash")]
+    fn verify_context_new_rejects_a_blob_action_without_a_hash() {
+        // An endpoint that implies a blob hash but forgets to supply it would
+        // silently skip `x` scoping, so such a context refuses to exist. This
+        // replaces a test that asserted MissingXTag for this combination -- a
+        // combination that is now a caller bug rather than a legal context.
+        let _ = VerifyContext::new(Action::Upload, HOST, None, NOW);
+    }
+
+    #[test]
+    fn verify_get_rejects_valueless_x_tag() {
+        // A tag `["x"]` names no hash, so it cannot scope the token. Mirrors
+        // the rule 5 handling of `["server"]`.
+        let mut tags = vec![
+            tag("t", "get"),
             tag("expiration", &(NOW + 3600).to_string()),
-            tag("x", X_HEX),
         ];
-        let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
-        let ctx = VerifyContext::new(Action::Upload, HOST, None, NOW);
-        assert_eq!(token(event).verify(ctx), Err(AuthError::MissingXTag));
+        tags.push(vec!["x".to_string()]);
+        let event = signed_event(24242, NOW - 100, tags, "Get blob");
+        let blob = Sha256::parse(X_HEX).unwrap();
+        let ctx = VerifyContext::new(Action::Get, HOST, Some(&blob), NOW);
+        assert_eq!(token(event).verify(ctx), Err(AuthError::XTagMismatch));
     }
 
     // ---- endpoint table is encoded in the type ---------------------------
@@ -787,6 +833,16 @@ mod tests {
         let blob = Sha256::parse(X_HEX).unwrap();
         assert!(VerifyContext::new(Action::Upload, HOST, Some(&blob), NOW).require_x());
         assert!(!VerifyContext::new(Action::Get, HOST, Some(&blob), NOW).require_x());
+    }
+
+    #[test]
+    fn action_implies_blob_truth_table() {
+        // BUD-11's "Implied Blob Hash" column: every endpoint but /list has one.
+        assert!(Action::Get.implies_blob());
+        assert!(Action::Upload.implies_blob());
+        assert!(Action::Delete.implies_blob());
+        assert!(Action::Media.implies_blob());
+        assert!(!Action::List.implies_blob());
     }
 
     // ---- verify: malformed signature material ----------------------------

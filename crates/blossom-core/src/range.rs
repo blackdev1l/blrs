@@ -63,6 +63,12 @@ pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
     let Some((unit, spec)) = value.split_once('=') else {
         return RangeOutcome::Malformed;
     };
+    // `range-unit = token` (RFC 9110 section 14.1). An empty or non-token unit
+    // is not an unrecognised range unit, it is not a range unit at all, so the
+    // header is malformed rather than merely one this server does not know.
+    if !is_token(unit) {
+        return RangeOutcome::Malformed;
+    }
     if !unit.eq_ignore_ascii_case("bytes") {
         return RangeOutcome::Full;
     }
@@ -116,6 +122,13 @@ pub fn parse_range(header: Option<&str>, total_len: u64) -> RangeOutcome {
     }
     let end = end.min(total_len - 1);
     RangeOutcome::Partial(ByteRange { start, end })
+}
+
+/// Whether `s` is a non-empty RFC 7230 `token`, the shape `range-unit` takes.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// Parses `1*DIGIT` (RFC 7233 section 2.1) as `u64`.
@@ -211,6 +224,17 @@ mod tests {
     fn unknown_unit_is_ignored() {
         // RFC 7233 section 3.1: ignore a Range header with an unfamiliar unit.
         assert_eq!(parse_range(Some("items=0-99"), 1000), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn non_token_unit_is_malformed() {
+        // An empty or non-token unit is not a range unit at all, so the header
+        // is malformed rather than merely unknown to this server.
+        assert_eq!(parse_range(Some("=0-99"), 1000), RangeOutcome::Malformed);
+        assert_eq!(
+            parse_range(Some("by tes=0-99"), 1000),
+            RangeOutcome::Malformed
+        );
     }
 
     #[test]
