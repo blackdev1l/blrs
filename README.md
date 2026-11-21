@@ -52,6 +52,17 @@ is what keeps the process inside a Pi's RAM regardless of file size.
 `blobs/<aa>/<sha256>` path after the hash matches. A failed or truncated upload
 can never be observed under its final name.
 
+**Crash-aware, bounded writes.** The temporary file is removed by a guard on
+any failed or cancelled upload, and `open` sweeps leftover `tmp/*.part` files.
+After the rename, the shard directory is `fsync`ed before the index row is
+inserted, and `open` re-indexes any orphan blob file (the filename is the hash,
+so the bytes are already valid). A re-upload of identical bytes is answered from
+the index without rewriting the SD card. Durability across a power cut is
+best-effort: a blob written but not yet indexed is recovered on the next start,
+but the most recent write can still be lost. A `DELETE` removes the file, then
+the row, and records the hash on the blocklist in the same transaction, so a
+removed blob cannot be re-uploaded (BUD-09).
+
 **Metadata is separate from bodies.** Size, MIME type, owner, and upload time
 live in SQLite, so `/list`, quota checks, and ownership checks are index lookups
 rather than directory walks.
