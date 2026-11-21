@@ -26,14 +26,25 @@ pub struct BlobMeta {
 pub struct PutOptions {
     /// When set, the body must hash to exactly this value or the put fails with
     /// [`StoreError::HashMismatch`]. This is the `X-SHA-256` header.
+    ///
+    /// It is also the BUD-02 fast path: when a blob with this hash is already
+    /// stored, the store answers [`PutOutcome::Existed`] **without reading the
+    /// body**. The caller is responsible for draining or closing the request
+    /// body on that path.
     pub expected: Option<Sha256>,
-    /// MIME type to record. When `None` the store sniffs the leading bytes and
-    /// falls back to the extension, then `application/octet-stream`.
+    /// MIME type to record. When `None` the store sniffs the leading bytes,
+    /// then falls back to `extension`, then `application/octet-stream`.
     pub mime: Option<MimeType>,
-    /// Recorded as the blob's owner. Ignored when the blob already exists.
+    /// Recorded as the blob's owner. Ignored when the blob already exists. Must
+    /// be 64-character lowercase hex or the put fails with
+    /// [`StoreError::InvalidOwner`].
     pub owner: Option<String>,
     /// Client-supplied size, used for an early rejection before reading the body.
     pub declared_size: Option<u64>,
+    /// Filename or extension (`.pdf`, `pdf`, or `photo.png`) used for the MIME
+    /// fallback when neither `mime` nor sniffing resolves a type. BUD-04's
+    /// `/mirror` sets this from the fetched URL.
+    pub extension: Option<String>,
 }
 
 /// Whether a put stored a new blob or matched an existing one.
@@ -59,8 +70,12 @@ pub enum DeleteOutcome {
 #[derive(Clone, Debug)]
 pub struct ListQuery {
     pub pubkey: String,
-    /// The `sha256` of the last blob on the previous page; excluded from results.
+    /// The `sha256` of the last blob on the previous page; excluded from
+    /// results. The cursor is only honoured when it names a blob owned by
+    /// `pubkey`; an unknown or other-owner cursor yields an empty page rather
+    /// than silently repeating the first page.
     pub cursor: Option<Sha256>,
+    /// Requested page size, clamped by the store to a small maximum.
     pub limit: u32,
     pub since: Option<i64>,
     pub until: Option<i64>,
@@ -104,7 +119,9 @@ pub trait BlobStore: Send + Sync + 'static {
     ///
     /// Never buffers the whole body in memory. If `opts.expected` is set and the
     /// computed hash differs, the temporary file is discarded and
-    /// [`StoreError::HashMismatch`] is returned.
+    /// [`StoreError::HashMismatch`] is returned. A cancelled or failed upload
+    /// leaves no temporary file behind, and a hash on the blocklist is refused
+    /// with [`StoreError::Blocked`] without storing the body.
     async fn put(
         &self,
         body: Box<dyn AsyncRead + Send + Unpin>,
@@ -115,6 +132,13 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn meta(&self, hash: &Sha256) -> Result<Option<BlobMeta>, StoreError>;
 
     /// Opens a blob for reading, optionally restricted to `range`.
+    ///
+    /// The stream is bounded to the row's `size`, so the bytes served always
+    /// match the advertised `Content-Length`. A `range` that is not fully
+    /// inside the blob is rejected with [`StoreError::InvalidRange`]. Returns
+    /// `Ok(None)` when no row exists. When a row exists but its blob file does
+    /// not, reading returns [`StoreError::Corrupt`]; `meta` still reports the
+    /// row, and a later `put` of the same bytes heals it.
     async fn read(
         &self,
         hash: &Sha256,
@@ -122,6 +146,13 @@ pub trait BlobStore: Send + Sync + 'static {
     ) -> Result<Option<BlobReader>, StoreError>;
 
     /// Deletes a blob, enforcing ownership.
+    ///
+    /// A blob whose `owner` is `None` may be deleted by any authenticated
+    /// requester; a blob with an owner is only removable by that owner. The
+    /// consequence is that blobs uploaded while the server ran with `--auth
+    /// none` are ownerless and stay deletable by anyone forever. A successful
+    /// delete records the hash on the blocklist so it cannot be re-uploaded
+    /// (BUD-09).
     async fn delete(&self, hash: &Sha256, requester: &str) -> Result<DeleteOutcome, StoreError>;
 
     /// Lists a pubkey's blobs, newest first, excluding the cursor (BUD-12).

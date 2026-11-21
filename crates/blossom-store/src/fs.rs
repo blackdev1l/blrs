@@ -2,13 +2,25 @@
 //!
 //! Bodies stream to a uniquely named file under `tmp/` in bounded chunks and
 //! are hashed as they arrive, so the whole body is never resident in memory.
-//! The file is `fsync`ed and renamed into place only after the hash has been
-//! verified, which is what keeps a partially written blob from ever appearing
-//! under its final name. Metadata is written once and never overwritten, so the
-//! first uploader's owner and upload time win regardless of races.
+//! The file is `fsync`ed, renamed into place, and the containing shard
+//! directory is `fsync`ed before the metadata row that references it is
+//! written. A guard removes the temp file on every non-successful exit,
+//! including a cancelled request, and [`FsBlobStore::open`] sweeps `tmp/*.part`
+//! left by a crash.
+//!
+//! Durability is best-effort, not absolute. A power cut can still lose the
+//! most recent writes:
+//!
+//! - an upload that had not reached the shard-directory `fsync` leaves no blob;
+//! - an upload that crashed after the rename but before the row insert leaves a
+//!   blob file with no row, which `open` re-indexes (the filename is the hash,
+//!   so the bytes are already valid);
+//! - a delete removes the file first and the row second, so a crash mid-delete
+//!   leaves an orphan file rather than a row pointing at a missing blob.
+//!
+//! `open` never resurrects a hash that is on the blocklist.
 
-use std::io::ErrorKind;
-use std::io::SeekFrom;
+use std::io::{ErrorKind, Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +49,21 @@ const CHUNK: usize = 64 * 1024;
 /// Leading bytes kept so an unsniffed MIME type can be guessed from the magic
 /// bytes without buffering the body.
 const SNIFF_LEN: usize = 512;
+
+/// Suffix of in-progress upload files under `tmp/`, swept by [`FsBlobStore::open`].
+const TMP_SUFFIX: &str = "part";
+
+/// Number of buckets in the per-hash lock array. A byte of the hash selects
+/// one, so unrelated blobs rarely contend.
+const HASH_BUCKETS: usize = 256;
+
+/// Largest number of hashes accepted in a single report. BUD-09 reports are
+/// operator-facing; an unbounded list is an easy way to grow the table.
+const MAX_REPORT_HASHES: usize = 32;
+
+/// Largest `ListQuery::limit` the store honours, regardless of what a caller
+/// asks for.
+const MAX_LIST_LIMIT: u32 = 100;
 
 /// A selected row from the `blobs` table, before validation.
 type RawMeta = (String, i64, String, i64, Option<String>);
@@ -67,13 +94,22 @@ struct Inner {
     tmp_dir: PathBuf,
     /// Monotonic suffix that makes concurrent temp files unique.
     tmp_seq: AtomicU64,
+    /// Per-hash-bucket locks serializing `put` and `delete` for one hash.
+    locks: Vec<tokio::sync::Mutex<()>>,
+    /// Rows re-inserted by the reconciliation pass in `open`.
+    reconciled: u64,
 }
 
 impl Inner {
+    /// The shard directory for a blob, `blobs/<aa>`.
+    fn shard_dir(&self, hash: &Sha256) -> PathBuf {
+        self.blobs_dir.join(&hash.to_hex()[..2])
+    }
+
     /// The final path for a blob, `blobs/<aa>/<sha256>`.
     fn blob_path(&self, hash: &Sha256) -> PathBuf {
         let hex = hash.to_hex();
-        self.blobs_dir.join(&hex[..2]).join(hex)
+        self.shard_dir(hash).join(hex)
     }
 
     /// A fresh, never-before-used path under `tmp/`.
@@ -99,9 +135,10 @@ impl Inner {
         insert_meta(&conn, meta)
     }
 
-    fn remove(&self, hash: &Sha256) -> Result<usize, StoreError> {
-        let conn = self.lock();
-        delete_meta(&conn, hash)
+    /// Deletes the row and records the hash on the blocklist in one transaction.
+    fn remove_and_block(&self, hash: &Sha256) -> Result<usize, StoreError> {
+        let mut conn = self.lock();
+        delete_meta_and_block(&mut conn, hash)
     }
 
     fn list(&self, query: &ListQuery) -> Result<Vec<BlobMeta>, StoreError> {
@@ -119,15 +156,26 @@ impl Inner {
         hash_blocked(&conn, hash)
     }
 
+    /// Recovers the connection guard even if a previous holder panicked:
+    /// one failed request must not take the store down for every later one.
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("index mutex poisoned")
+        match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The `put`/`delete` lock for a hash.
+    fn keyed_lock(&self, hash: &Sha256) -> &tokio::sync::Mutex<()> {
+        &self.locks[usize::from(hash.as_bytes()[0])]
     }
 }
 
 impl FsBlobStore {
     /// Opens (creating if needed) a blob store rooted at `config.data_dir`.
     ///
-    /// Creates the directory tree and applies the SQLite schema.
+    /// Creates the directory tree, applies the SQLite schema, sweeps leftover
+    /// `tmp/*.part` files, and reconciles blob files that have no index row.
     pub async fn open(config: StoreConfig) -> Result<Self, StoreError> {
         let blobs_dir = config.data_dir.join("blobs");
         let tmp_dir = config.data_dir.join("tmp");
@@ -138,12 +186,18 @@ impl FsBlobStore {
         let inner = blocking(move || -> Result<Inner, StoreError> {
             let conn = Connection::open(&db_path)?;
             conn.execute_batch(SCHEMA)?;
+            sweep_tmp(&tmp_dir);
+            let reconciled = reconcile(&conn, &blobs_dir);
             Ok(Inner {
                 config,
                 conn: Mutex::new(conn),
                 blobs_dir,
                 tmp_dir,
                 tmp_seq: AtomicU64::new(0),
+                locks: (0..HASH_BUCKETS)
+                    .map(|_| tokio::sync::Mutex::new(()))
+                    .collect(),
+                reconciled,
             })
         })
         .await?;
@@ -151,6 +205,12 @@ impl FsBlobStore {
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Number of orphan blob files the reconciliation pass in [`Self::open`]
+    /// re-inserted into the index. Zero on a clean start.
+    pub fn reconciled_count(&self) -> u64 {
+        self.inner.reconciled
     }
 
     /// The shared implementation of [`BlobStore::put`] with an explicit upload
@@ -161,24 +221,51 @@ impl FsBlobStore {
         opts: PutOptions,
         uploaded: i64,
     ) -> Result<PutOutcome, StoreError> {
+        let PutOptions {
+            expected,
+            mime,
+            owner,
+            declared_size,
+            extension,
+        } = opts;
         let max = self.inner.config.max_blob_size;
 
+        // An owner is a BUD-12 hex pubkey; reject anything else before storing,
+        // so a bad value cannot later fail every delete and hide the blob.
+        if let Some(owner) = owner.as_deref() {
+            if Sha256::parse(owner).is_err() {
+                return Err(StoreError::InvalidOwner);
+            }
+        }
+
+        // BUD-02 lets `X-SHA-256` be used for policy before persisting. This
+        // fast path runs before the declared-size check, so re-uploading a
+        // known blob answers `Existed` even if the client over-declared its
+        // `Content-Length`.
+        if let Some(expected) = expected {
+            if self.is_blocked(&expected).await? {
+                return Err(StoreError::Blocked);
+            }
+            if let Some(existing) = self.meta(&expected).await? {
+                // A row whose file is missing is not really stored: fall
+                // through so the streaming path can heal it.
+                if tokio::fs::try_exists(self.inner.blob_path(&expected)).await? {
+                    return Ok(PutOutcome::Existed(existing));
+                }
+            }
+        }
+
         // A declared size over the limit never needs the body at all.
-        if let Some(declared) = opts.declared_size {
+        if let Some(declared) = declared_size {
             if declared > max {
                 return Err(StoreError::TooLarge);
             }
         }
 
-        // BUD-02 lets `X-SHA-256` be used for policy before persisting: if the
-        // blob is already known, answer without reading the body.
-        if let Some(expected) = opts.expected {
-            if let Some(existing) = self.meta(&expected).await? {
-                return Ok(PutOutcome::Existed(existing));
-            }
-        }
-
         let tmp_path = self.inner.new_tmp_path();
+        // From here on every exit path — an error or a cancelled future —
+        // removes the temp file; only a successful rename disarms the guard.
+        let mut guard = TempGuard::new(tmp_path.clone());
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -189,49 +276,72 @@ impl FsBlobStore {
             Ok(streamed) => streamed,
             Err(err) => {
                 drop(file);
-                discard(&tmp_path).await;
                 return Err(err);
             }
         };
 
-        if let Some(expected) = opts.expected {
+        if let Some(expected) = expected {
             if hash != expected {
                 drop(file);
-                discard(&tmp_path).await;
                 return Err(StoreError::HashMismatch);
             }
         }
 
-        // The hash is verified; only now make the bytes durable and move them
-        // under the content-addressed name.
+        // Once the content is known, a blocklisted hash must be refused.
+        if self.is_blocked(&hash).await? {
+            drop(file);
+            return Err(StoreError::Blocked);
+        }
+
+        // The hash is verified; only now make the bytes durable.
         let durable = async {
             file.flush().await?;
-            file.sync_all().await?;
-            Ok::<(), StoreError>(())
+            file.sync_all().await
         }
         .await;
         drop(file);
-        if let Err(err) = durable {
-            discard(&tmp_path).await;
-            return Err(err);
+        durable?;
+
+        // Serialize the rest per hash so a concurrent delete cannot remove the
+        // file between the rename and the insert, or vice versa.
+        let lock = self.inner.keyed_lock(&hash);
+        let _lock = lock.lock().await;
+
+        let shard = self.inner.shard_dir(&hash);
+        let dest = shard.join(hash.to_hex());
+
+        // Re-uploading identical bytes: discard the temp copy instead of
+        // rewriting the same bytes to the SD card and losing the original
+        // mtime. A row whose file is gone is healed instead.
+        if let Some(existing) = self.meta(&hash).await? {
+            if tokio::fs::try_exists(&dest).await? {
+                return Ok(PutOutcome::Existed(existing));
+            }
+            tokio::fs::create_dir_all(&shard).await?;
+            tokio::fs::rename(&tmp_path, &dest).await?;
+            guard.disarm();
+            sync_dir(&shard).await?;
+            return Ok(PutOutcome::Existed(existing));
         }
 
-        let mime = opts
-            .mime
-            .unwrap_or_else(|| MimeType::sniff(&head).unwrap_or_else(MimeType::octet_stream));
+        let mime = mime
+            .or_else(|| MimeType::sniff(&head))
+            .or_else(|| extension.as_deref().and_then(MimeType::from_extension))
+            .unwrap_or_else(MimeType::octet_stream);
 
-        let dest = self.inner.blob_path(&hash);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        tokio::fs::create_dir_all(&shard).await?;
         tokio::fs::rename(&tmp_path, &dest).await?;
+        guard.disarm();
+        // fsync the shard directory so the rename is durable before the row
+        // that references it is written.
+        sync_dir(&shard).await?;
 
         let meta = BlobMeta {
             sha256: hash,
             size,
             mime,
             uploaded,
-            owner: opts.owner,
+            owner,
         };
 
         let inner = Arc::clone(&self.inner);
@@ -245,7 +355,7 @@ impl FsBlobStore {
             // canonical ones.
             match self.meta(&hash).await? {
                 Some(existing) => Ok(PutOutcome::Existed(existing)),
-                None => Err(StoreError::Corrupt(
+                None => Err(StoreError::IndexTask(
                     "index row disappeared after insert".to_string(),
                 )),
             }
@@ -278,6 +388,14 @@ impl BlobStore for FsBlobStore {
             return Ok(None);
         };
 
+        // A range that is not inside the row's size would make the advertised
+        // `Content-Length` disagree with the bytes on the wire.
+        if let Some(range) = range.as_ref() {
+            if range.start > range.end || range.end >= meta.size {
+                return Err(StoreError::InvalidRange);
+            }
+        }
+
         let path = self.inner.blob_path(hash);
         let mut file = match File::open(&path).await {
             Ok(file) => file,
@@ -290,14 +408,14 @@ impl BlobStore for FsBlobStore {
             Err(err) => return Err(err.into()),
         };
 
-        // Opening the file reads nothing: the returned stream stays lazy and a
-        // range is expressed as a seek plus a bounded `Take`.
+        // Opening the file reads nothing: the returned stream stays lazy and is
+        // bounded to the row's size, so a file that grew cannot over-send.
         let stream: Box<dyn AsyncRead + Send + Unpin> = match range {
             Some(range) => {
                 file.seek(SeekFrom::Start(range.start)).await?;
                 Box::new(file.take(range.len()))
             }
-            None => Box::new(file),
+            None => Box::new(file.take(meta.size)),
         };
 
         Ok(Some(BlobReader {
@@ -308,6 +426,12 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn delete(&self, hash: &Sha256, requester: &str) -> Result<DeleteOutcome, StoreError> {
+        // Hold the per-hash lock across the whole delete so a concurrent put
+        // cannot land a file we are about to remove, and so this delete cannot
+        // miss a blob that a concurrent put is right now committing.
+        let lock = self.inner.keyed_lock(hash);
+        let _lock = lock.lock().await;
+
         let Some(meta) = self.meta(hash).await? else {
             return Ok(DeleteOutcome::NotFound);
         };
@@ -321,17 +445,21 @@ impl BlobStore for FsBlobStore {
             }
         }
 
-        let inner = Arc::clone(&self.inner);
-        let owned = *hash;
-        let changed = blocking(move || inner.remove(&owned)).await?;
-        if changed == 0 {
-            return Ok(DeleteOutcome::NotFound);
-        }
-
+        // Remove the file first, then the row, so a crash leaves an orphan file
+        // that `open` reconciles rather than a row pointing at nothing.
         match tokio::fs::remove_file(self.inner.blob_path(hash)).await {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
+        }
+
+        // BUD-09/12: a removed blob is blocked in the same transaction as the
+        // row delete, so it cannot be rewritten.
+        let inner = Arc::clone(&self.inner);
+        let owned = *hash;
+        let changed = blocking(move || inner.remove_and_block(&owned)).await?;
+        if changed == 0 {
+            return Ok(DeleteOutcome::NotFound);
         }
 
         Ok(DeleteOutcome::Deleted)
@@ -343,6 +471,9 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn save_report(&self, report: ReportRecord) -> Result<(), StoreError> {
+        if report.hashes.len() > MAX_REPORT_HASHES {
+            return Err(StoreError::TooLarge);
+        }
         let inner = Arc::clone(&self.inner);
         blocking(move || inner.save(&report)).await
     }
@@ -354,7 +485,41 @@ impl BlobStore for FsBlobStore {
     }
 }
 
-/// Runs a synchronous closure on the blocking pool and unwraps the join result.
+/// Deletes an in-progress temp file unless it has been disarmed.
+///
+/// `put` arms this as soon as it has a temp path and disarms it only after the
+/// file has been renamed into place, so a cancelled upload, a client abort, or
+/// any early return cannot leave `tmp/*.part` behind. `Drop` cannot await, so
+/// the removal is a blocking `std::fs::remove_file`.
+struct TempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// Keeps the temp file, called once it has been renamed into place.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Runs a synchronous closure on the blocking pool.
+///
+/// The closure's own `Result` is returned unchanged. An `Err` from the join
+/// itself means the blocking task failed to run or panicked, which is reported
+/// as [`StoreError::IndexTask`].
 async fn blocking<T, F>(f: F) -> Result<T, StoreError>
 where
     T: Send + 'static,
@@ -362,7 +527,7 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|err| StoreError::Corrupt(format!("index task failed: {err}")))?
+        .map_err(|err| StoreError::IndexTask(err.to_string()))?
 }
 
 /// Reads `body` to EOF in bounded chunks, hashing and writing as it goes.
@@ -377,7 +542,8 @@ async fn stream_body(
     let mut buf = vec![0u8; CHUNK];
 
     loop {
-        let read = body.read(&mut buf).await?;
+        // A failure here is the client's body, not the disk.
+        let read = body.read(&mut buf).await.map_err(StoreError::BodyRead)?;
         if read == 0 {
             break;
         }
@@ -396,9 +562,98 @@ async fn stream_body(
     Ok((Sha256::from_bytes(hasher.finalize().into()), head, total))
 }
 
-/// Best-effort removal of an abandoned temp file.
-async fn discard(path: &Path) {
-    let _ = tokio::fs::remove_file(path).await;
+/// Opens a directory and `fsync`s it, making a completed rename durable.
+async fn sync_dir(path: &Path) -> Result<(), StoreError> {
+    let dir = File::open(path).await?;
+    dir.sync_all().await?;
+    Ok(())
+}
+
+/// Removes leftover `tmp/*.part` files from a previous run that crashed before
+/// its upload finished.
+fn sweep_tmp(tmp_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some(TMP_SUFFIX) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Re-inserts an index row for every blob file that survived a crash before its
+/// row was written. The filename is the blob's sha256, so the bytes are already
+/// content-addressed and trustworthy; size comes from the file, the MIME type
+/// from sniffing its head, and `uploaded` from the file mtime. A file whose
+/// hash is blocklisted is deleted instead, so a removed blob is never
+/// resurrected. Returns the number of rows inserted.
+fn reconcile(conn: &Connection, blobs_dir: &Path) -> u64 {
+    let Ok(shards) = std::fs::read_dir(blobs_dir) else {
+        return 0;
+    };
+    let mut inserted = 0;
+    for shard in shards.flatten() {
+        if !shard.path().is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Ok(hash) = Sha256::parse(name) else {
+                continue;
+            };
+            // Only the canonical path counts; anything else is not ours.
+            if path != blobs_dir.join(&hash.to_hex()[..2]).join(name) {
+                continue;
+            }
+            if hash_blocked(conn, &hash).unwrap_or(false) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if matches!(lookup_meta(conn, &hash), Ok(Some(_))) {
+                continue;
+            }
+            let Some(meta) = meta_from_file(&path, &hash) else {
+                continue;
+            };
+            if matches!(insert_meta(conn, &meta), Ok(1)) {
+                inserted += 1;
+            }
+        }
+    }
+    inserted
+}
+
+/// Builds a row for an untracked blob file: size from the file, MIME from the
+/// head, `uploaded` from the mtime, and no owner.
+fn meta_from_file(path: &Path, hash: &Sha256) -> Option<BlobMeta> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let uploaded = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut head = [0u8; SNIFF_LEN];
+    let read = {
+        let mut file = std::fs::File::open(path).ok()?;
+        file.read(&mut head).ok()?
+    };
+    let mime = MimeType::sniff(&head[..read]).unwrap_or_else(MimeType::octet_stream);
+    Some(BlobMeta {
+        sha256: *hash,
+        size: metadata.len(),
+        mime,
+        uploaded,
+        owner: None,
+    })
 }
 
 /// The current unix timestamp, or `0` if the clock predates the epoch.
@@ -423,9 +678,11 @@ fn tuple_to_meta(raw: RawMeta) -> Result<BlobMeta, StoreError> {
     let (hex, size, mime, uploaded, owner) = raw;
     let sha256 = Sha256::parse(&hex)
         .map_err(|err| StoreError::Corrupt(format!("index has invalid sha256 {hex:?}: {err}")))?;
+    let size = u64::try_from(size)
+        .map_err(|_| StoreError::Corrupt(format!("index has negative size {size} for {hex}")))?;
     Ok(BlobMeta {
         sha256,
-        size: size as u64,
+        size,
         mime: MimeType::parse(&mime),
         uploaded,
         owner,
@@ -458,16 +715,31 @@ fn insert_meta(conn: &Connection, meta: &BlobMeta) -> Result<usize, StoreError> 
     Ok(changed)
 }
 
-fn delete_meta(conn: &Connection, hash: &Sha256) -> Result<usize, StoreError> {
-    let changed = conn.execute("DELETE FROM blobs WHERE sha256 = ?1", [hash.to_hex()])?;
+/// Deletes the blob's row and records its hash on the blocklist atomically.
+fn delete_meta_and_block(conn: &mut Connection, hash: &Sha256) -> Result<usize, StoreError> {
+    let tx = conn.transaction()?;
+    let changed = tx.execute("DELETE FROM blobs WHERE sha256 = ?1", [hash.to_hex()])?;
+    if changed == 0 {
+        return Ok(0);
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO blocklist (sha256, blocked_at) VALUES (?1, ?2)",
+        rusqlite::params![hash.to_hex(), now_unix()],
+    )?;
+    tx.commit()?;
     Ok(changed)
 }
 
-fn cursor_uploaded(conn: &Connection, hash: &Sha256) -> Result<Option<i64>, StoreError> {
+/// The `uploaded` time of a blob, only when it belongs to `owner`.
+fn cursor_uploaded(
+    conn: &Connection,
+    hash: &Sha256,
+    owner: &str,
+) -> Result<Option<i64>, StoreError> {
     let uploaded = conn
         .query_row(
-            "SELECT uploaded FROM blobs WHERE sha256 = ?1",
-            [hash.to_hex()],
+            "SELECT uploaded FROM blobs WHERE sha256 = ?1 AND owner = ?2",
+            rusqlite::params![hash.to_hex(), owner],
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
@@ -475,21 +747,23 @@ fn cursor_uploaded(conn: &Connection, hash: &Sha256) -> Result<Option<i64>, Stor
 }
 
 fn list_meta(conn: &Connection, query: &ListQuery) -> Result<Vec<BlobMeta>, StoreError> {
-    // A cursor that is not in the index cannot anchor a page: return nothing
-    // rather than silently serving the first page again.
+    let owner = query.pubkey.clone();
+
+    // A cursor that is not in the index, or belongs to another owner, cannot
+    // anchor a page: return nothing rather than leaking another user's
+    // timestamp or silently serving the first page again.
     let cursor_pos = match query.cursor {
         None => None,
-        Some(hash) => match cursor_uploaded(conn, &hash)? {
+        Some(hash) => match cursor_uploaded(conn, &hash, &owner)? {
             None => return Ok(Vec::new()),
             Some(uploaded) => Some((uploaded, hash)),
         },
     };
 
-    let owner = query.pubkey.clone();
     let cursor_hex = cursor_pos.as_ref().map(|(_, hash)| hash.to_hex());
     let since = query.since;
     let until = query.until;
-    let limit = i64::from(query.limit);
+    let limit = i64::from(query.limit.min(MAX_LIST_LIMIT));
 
     let mut sql =
         String::from("SELECT sha256, size, mime, uploaded, owner FROM blobs WHERE owner = ?");
@@ -525,26 +799,23 @@ fn list_meta(conn: &Connection, query: &ListQuery) -> Result<Vec<BlobMeta>, Stor
 }
 
 fn insert_report(conn: &mut Connection, report: &ReportRecord) -> Result<(), StoreError> {
-    // One `reports` row per hash, and each reported hash joins the blocklist so
-    // `is_blocked` (which reads only `blocklist`) reflects the report.
+    // Reporting is not removal (BUD-09): a report is recorded for operator
+    // review and does NOT block. The unique key plus `INSERT OR IGNORE` makes a
+    // repeat report a no-op instead of growing the table without bound.
     let tx = conn.transaction()?;
     {
-        let mut report_stmt = tx.prepare(
-            "INSERT INTO reports (sha256, reporter, kind, content, created_at) \
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO reports (sha256, reporter, kind, content, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        let mut block_stmt =
-            tx.prepare("INSERT OR IGNORE INTO blocklist (sha256, blocked_at) VALUES (?1, ?2)")?;
         for hash in &report.hashes {
-            let hex = hash.to_hex();
-            report_stmt.execute(rusqlite::params![
-                hex,
+            stmt.execute(rusqlite::params![
+                hash.to_hex(),
                 report.reporter,
                 report.kind,
                 report.content,
                 report.created_at,
             ])?;
-            block_stmt.execute(rusqlite::params![hex, report.created_at])?;
         }
     }
     tx.commit()?;
@@ -562,12 +833,13 @@ fn hash_blocked(conn: &Connection, hash: &Sha256) -> Result<bool, StoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
     use tokio::io::ReadBuf;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     use super::*;
 
@@ -593,6 +865,11 @@ mod tests {
 
     fn hash_of(hex: &str) -> Sha256 {
         Sha256::parse(hex).unwrap()
+    }
+
+    /// A 64-character lowercase-hex pubkey, the only owner shape accepted.
+    fn pubkey(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
     }
 
     /// Number of files anywhere under `dir`, used to prove nothing was stored.
@@ -659,10 +936,82 @@ mod tests {
         }
     }
 
+    /// A reader that serves bytes lazily from a counter and records how many it
+    /// produced, so a test can prove the store does not read a whole body.
+    struct CountingReader {
+        remaining: u64,
+        produced: Arc<AtomicU64>,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let n = this.remaining.min(buf.remaining().min(CHUNK) as u64) as usize;
+            if n == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let chunk = vec![0x5a_u8; n];
+            buf.put_slice(&chunk);
+            this.remaining -= n as u64;
+            this.produced.fetch_add(n as u64, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reader that yields some bytes and then fails, modelling a client that
+    /// aborts partway through an upload.
+    struct ErrorReader {
+        produced: bool,
+    }
+
+    impl AsyncRead for ErrorReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.produced {
+                return Poll::Ready(Err(std::io::Error::other("client aborted")));
+            }
+            this.produced = true;
+            buf.put_slice(b"partial body");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reader that yields one chunk and then never finishes, so a put future
+    /// can be abandoned mid-stream.
+    struct HangReader {
+        started: Arc<Notify>,
+        sent: bool,
+    }
+
+    impl AsyncRead for HangReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.sent {
+                return Poll::Pending;
+            }
+            this.sent = true;
+            buf.put_slice(&[0x7f_u8; 4096]);
+            this.started.notify_one();
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn put_small_blob_creates_and_stores_it() {
         let (store, dir) = open_store(1024).await;
-        let owner = "ab".repeat(32);
+        let owner = pubkey(0xab);
 
         let outcome = store
             .put(
@@ -723,14 +1072,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mime_falls_back_from_sniff_to_extension_to_octet_stream() {
+        let (store, _dir) = open_store(1024).await;
+
+        // `mime` wins over everything, including a sniffable body.
+        let explicit = store
+            .put(
+                body(b"\x89PNG\r\n\x1a\nrest"),
+                PutOptions {
+                    mime: Some(MimeType::parse("text/plain")),
+                    extension: Some("pdf".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let PutOutcome::Created(explicit) = explicit else {
+            panic!("expected Created");
+        };
+        assert_eq!(explicit.mime.as_str(), "text/plain");
+
+        // Sniffing wins over the extension.
+        let sniffed = store
+            .put(
+                body(b"\x89PNG\r\n\x1a\nrest-two"),
+                PutOptions {
+                    extension: Some("txt".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let PutOutcome::Created(sniffed) = sniffed else {
+            panic!("expected Created");
+        };
+        assert_eq!(sniffed.mime.as_str(), "image/png");
+
+        // No magic bytes: the extension resolves the type.
+        let extension = store
+            .put(
+                body(b"just some bytes with no signature"),
+                PutOptions {
+                    extension: Some("photo.pdf".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let PutOutcome::Created(extension) = extension else {
+            panic!("expected Created");
+        };
+        assert_eq!(extension.mime.as_str(), "application/pdf");
+
+        // Nothing resolves it: the octet-stream fallback.
+        let fallback = store
+            .put(
+                body(b"just some bytes with no signature two"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let PutOutcome::Created(fallback) = fallback else {
+            panic!("expected Created");
+        };
+        assert_eq!(fallback.mime.as_str(), MimeType::OCTET_STREAM);
+    }
+
+    #[tokio::test]
     async fn reupload_returns_existed_with_first_owner_and_time() {
         let (store, _dir) = open_store(1024).await;
+        let first_owner = pubkey(0x11);
+        let second_owner = pubkey(0x22);
 
         let first = store
             .put_with_time(
                 body(b"hello world"),
                 PutOptions {
-                    owner: Some("first".to_string()),
+                    owner: Some(first_owner.clone()),
                     ..Default::default()
                 },
                 1_000,
@@ -745,7 +1163,7 @@ mod tests {
             .put_with_time(
                 body(b"hello world"),
                 PutOptions {
-                    owner: Some("second".to_string()),
+                    owner: Some(second_owner),
                     ..Default::default()
                 },
                 2_000,
@@ -758,7 +1176,35 @@ mod tests {
 
         assert_eq!(second_meta, first_meta);
         assert_eq!(second_meta.uploaded, 1_000);
-        assert_eq!(second_meta.owner.as_deref(), Some("first"));
+        assert_eq!(second_meta.owner.as_deref(), Some(first_owner.as_str()));
+    }
+
+    #[tokio::test]
+    async fn reupload_without_fast_path_does_not_rewrite_the_file() {
+        let (store, dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        let path = store.inner.blob_path(&hash);
+        let inode_before = std::fs::metadata(&path).unwrap().ino();
+
+        // No X-SHA-256: the body is streamed and hashed, but the identical
+        // bytes must not be renamed over the existing file.
+        let outcome = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_before,
+            "a re-upload must not replace the blob file"
+        );
+        assert_eq!(count_files(&dir.path().join("tmp")), 0);
     }
 
     #[tokio::test]
@@ -845,6 +1291,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_stream_stops_after_one_chunk() {
+        let (store, dir) = open_store(16).await;
+        let produced = Arc::new(AtomicU64::new(0));
+        let reader = CountingReader {
+            remaining: 1 << 40,
+            produced: Arc::clone(&produced),
+        };
+
+        let err = store
+            .put(Box::new(reader), PutOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StoreError::TooLarge));
+        let served = produced.load(Ordering::Relaxed);
+        assert!(
+            served <= 16 + CHUNK as u64,
+            "the store read {served} bytes of a body it had already rejected"
+        );
+        assert_eq!(count_files(&dir.path().join("tmp")), 0);
+    }
+
+    #[tokio::test]
     async fn declared_size_over_limit_is_rejected_without_reading() {
         let (store, dir) = open_store(16).await;
 
@@ -862,6 +1331,177 @@ mod tests {
         assert!(matches!(err, StoreError::TooLarge));
         assert_eq!(count_files(&dir.path().join("blobs")), 0);
         assert_eq!(count_files(&dir.path().join("tmp")), 0);
+    }
+
+    #[tokio::test]
+    async fn declared_size_over_limit_is_ignored_for_an_existing_blob() {
+        let (store, _dir) = open_store(16).await;
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        // BUD-02: the X-SHA-256 fast path answers 200 before size policy.
+        let outcome = store
+            .put(
+                Box::new(FailReader),
+                PutOptions {
+                    expected: Some(hash_of(HELLO_WORLD_HASH)),
+                    declared_size: Some(1_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_leaves_no_temp_file() {
+        let (store, dir) = open_store(1024 * 1024).await;
+        let tmp = dir.path().join("tmp");
+        let started = Arc::new(Notify::new());
+
+        {
+            let fut = store.put(
+                Box::new(HangReader {
+                    started: Arc::clone(&started),
+                    sent: false,
+                }),
+                PutOptions::default(),
+            );
+            tokio::pin!(fut);
+
+            tokio::select! {
+                () = started.notified() => {}
+                out = fut.as_mut() => panic!("put finished unexpectedly: {out:?}"),
+            }
+
+            // Mid-upload the temp file exists; abandoning the future (at the
+            // end of this block) must remove it.
+            assert_eq!(count_files(&tmp), 1);
+        }
+        assert_eq!(count_files(&tmp), 0);
+    }
+
+    #[tokio::test]
+    async fn body_error_mid_stream_is_reported_and_cleans_up() {
+        let (store, dir) = open_store(1024).await;
+
+        let err = store
+            .put(
+                Box::new(ErrorReader { produced: false }),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StoreError::BodyRead(_)));
+        assert_eq!(count_files(&dir.path().join("blobs")), 0);
+        assert_eq!(count_files(&dir.path().join("tmp")), 0);
+    }
+
+    #[tokio::test]
+    async fn put_fails_and_cleans_up_when_the_shard_cannot_be_created() {
+        let (store, dir) = open_store(1024).await;
+        // Occupy the shard path with a file so `create_dir_all` must fail.
+        let shard = dir.path().join("blobs").join(&HELLO_WORLD_HASH[..2]);
+        std::fs::write(&shard, b"not a directory").unwrap();
+
+        let err = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StoreError::Io(_)));
+        assert_eq!(count_files(&dir.path().join("tmp")), 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_the_same_directory_keeps_blobs_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+        };
+
+        {
+            let store = FsBlobStore::open(config.clone()).await.unwrap();
+            store
+                .put(body(b"hello world"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+
+        // Schema application is idempotent and the data survives a restart.
+        let store = FsBlobStore::open(config).await.unwrap();
+        let hash = hash_of(HELLO_WORLD_HASH);
+        assert!(store.meta(&hash).await.unwrap().is_some());
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn open_reconciles_a_blob_file_that_has_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"\x89PNG\r\n\x1a\nreconciled-body";
+        let hash = {
+            let mut hasher = Sha2::new();
+            hasher.update(data);
+            Sha256::from_bytes(hasher.finalize().into())
+        };
+        let hex = hash.to_hex();
+        let shard = dir.path().join("blobs").join(&hex[..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join(&hex), data).unwrap();
+
+        let store = FsBlobStore::open(StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(store.reconciled_count(), 1);
+        let meta = store.meta(&hash).await.unwrap().unwrap();
+        assert_eq!(meta.size, data.len() as u64);
+        assert_eq!(meta.mime.as_str(), "image/png");
+        assert_eq!(meta.owner, None);
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, data);
+    }
+
+    #[tokio::test]
+    async fn open_removes_a_blocked_blob_file_and_does_not_resurrect_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+        };
+        let hash = hash_of(ABC_HASH);
+        let hex = hash.to_hex();
+
+        {
+            let store = FsBlobStore::open(config.clone()).await.unwrap();
+            store
+                .put(body(b"abc"), PutOptions::default())
+                .await
+                .unwrap();
+            // Deleting blocks the hash and removes the file.
+            assert_eq!(
+                store.delete(&hash, "anyone").await.unwrap(),
+                DeleteOutcome::Deleted
+            );
+            // Simulate a crash leftover by re-creating the file.
+            let shard = dir.path().join("blobs").join(&hex[..2]);
+            std::fs::create_dir_all(&shard).unwrap();
+            std::fs::write(shard.join(&hex), b"abc").unwrap();
+        }
+
+        let store = FsBlobStore::open(config).await.unwrap();
+        assert_eq!(store.reconciled_count(), 0);
+        assert!(store.meta(&hash).await.unwrap().is_none());
+        assert!(!dir.path().join("blobs").join(&hex[..2]).join(&hex).exists());
     }
 
     #[tokio::test]
@@ -902,14 +1542,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_bounds_the_stream_to_the_indexed_size() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        // Simulate a file that grew past its row (corruption or a partial
+        // overwrite): the store must not serve more than `meta.size`.
+        let path = store.inner.blob_path(&hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"TRAILING GARBAGE");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn range_outside_the_blob_is_rejected() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        let err = store
+            .read(&hash, Some(ByteRange { start: 0, end: 99 }))
+            .await
+            .err()
+            .expect("a range past the end must be rejected");
+        assert!(matches!(err, StoreError::InvalidRange));
+    }
+
+    #[tokio::test]
+    async fn read_reports_corrupt_when_the_row_has_no_file() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        std::fs::remove_file(store.inner.blob_path(&hash)).unwrap();
+
+        // The row survives, so `meta` still reports it...
+        assert!(store.meta(&hash).await.unwrap().is_some());
+        // ...but reading the bytes is a documented `Corrupt` error.
+        let err = store
+            .read(&hash, None)
+            .await
+            .err()
+            .expect("a missing file must be reported");
+        assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    #[tokio::test]
     async fn delete_enforces_ownership_and_removes_the_blob() {
         let (store, _dir) = open_store(1024).await;
         let hash = hash_of(HELLO_WORLD_HASH);
+        let owner = pubkey(0x11);
         store
             .put(
                 body(b"hello world"),
                 PutOptions {
-                    owner: Some("owner-a".to_string()),
+                    owner: Some(owner.clone()),
                     ..Default::default()
                 },
             )
@@ -918,14 +1617,14 @@ mod tests {
         let path = store.inner.blob_path(&hash);
 
         assert_eq!(
-            store.delete(&hash, "owner-b").await.unwrap(),
+            store.delete(&hash, &pubkey(0x22)).await.unwrap(),
             DeleteOutcome::NotOwner
         );
         assert!(store.meta(&hash).await.unwrap().is_some());
         assert!(path.exists());
 
         assert_eq!(
-            store.delete(&hash, "owner-a").await.unwrap(),
+            store.delete(&hash, &owner).await.unwrap(),
             DeleteOutcome::Deleted
         );
         assert!(store.meta(&hash).await.unwrap().is_none());
@@ -933,7 +1632,7 @@ mod tests {
         assert!(store.read(&hash, None).await.unwrap().is_none());
 
         assert_eq!(
-            store.delete(&hash, "owner-a").await.unwrap(),
+            store.delete(&hash, &owner).await.unwrap(),
             DeleteOutcome::NotFound
         );
     }
@@ -954,15 +1653,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_owner_is_rejected() {
+        let (store, _dir) = open_store(1024).await;
+
+        for bad in [
+            "not-hex".to_string(),
+            "AB".repeat(32), // uppercase hex is not a valid pubkey
+            "a".repeat(63),  // too short
+        ] {
+            let err = store
+                .put(
+                    body(b"hello world"),
+                    PutOptions {
+                        owner: Some(bad),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StoreError::InvalidOwner));
+        }
+
+        // The canonical lowercase form is accepted.
+        let outcome = store
+            .put(
+                body(b"hello world"),
+                PutOptions {
+                    owner: Some(pubkey(0x11)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Created(_)));
+    }
+
+    #[tokio::test]
+    async fn blocked_hash_is_refused_but_reporting_does_not_block() {
+        let (store, _dir) = open_store(1024).await;
+        let owner = pubkey(0x11);
+        let hash = hash_of(HELLO_WORLD_HASH);
+
+        store
+            .put(
+                body(b"hello world"),
+                PutOptions {
+                    owner: Some(owner.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.delete(&hash, &owner).await.unwrap(),
+            DeleteOutcome::Deleted
+        );
+
+        // BUD-09: removal blocks the hash, so it cannot be rewritten.
+        assert!(store.is_blocked(&hash).await.unwrap());
+        let err = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Blocked));
+
+        // The X-SHA-256 fast path must also refuse, without reading the body.
+        let err = store
+            .put(
+                Box::new(FailReader),
+                PutOptions {
+                    expected: Some(hash),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Blocked));
+
+        // Reporting is not removal: a report must never block.
+        let reported = hash_of(ABC_HASH);
+        store
+            .save_report(ReportRecord {
+                hashes: vec![reported],
+                reporter: pubkey(0x22),
+                kind: "malware".to_string(),
+                content: "bad blob".to_string(),
+                created_at: 123,
+            })
+            .await
+            .unwrap();
+        assert!(!store.is_blocked(&reported).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn repeat_reports_are_deduplicated() {
+        let (store, _dir) = open_store(1024).await;
+        let report = || ReportRecord {
+            hashes: vec![hash_of(HELLO_WORLD_HASH)],
+            reporter: pubkey(0x22),
+            kind: "malware".to_string(),
+            content: "bad blob".to_string(),
+            created_at: 123,
+        };
+
+        store.save_report(report()).await.unwrap();
+        store.save_report(report()).await.unwrap();
+
+        let count: i64 = store
+            .inner
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn report_with_too_many_hashes_is_rejected() {
+        let (store, _dir) = open_store(1024).await;
+        let hashes: Vec<Sha256> = (0..33u8).map(|i| Sha256::from_bytes([i; 32])).collect();
+
+        let err = store
+            .save_report(ReportRecord {
+                hashes,
+                reporter: pubkey(0x22),
+                kind: "spam".to_string(),
+                content: String::new(),
+                created_at: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::TooLarge));
+
+        let count: i64 = store
+            .inner
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn list_paginates_newest_first_and_filters_by_owner_and_time() {
         let (store, _dir) = open_store(1024).await;
-        let oldest = put_at(&store, b"aaa", "pk1", 100).await;
-        let middle = put_at(&store, b"bbb", "pk1", 200).await;
-        let newest = put_at(&store, b"ccc", "pk1", 300).await;
-        let other = put_at(&store, b"ddd", "pk2", 400).await;
+        let owner_a = pubkey(0x11);
+        let owner_b = pubkey(0x22);
+        let oldest = put_at(&store, b"aaa", &owner_a, 100).await;
+        let middle = put_at(&store, b"bbb", &owner_a, 200).await;
+        let newest = put_at(&store, b"ccc", &owner_a, 300).await;
+        let other = put_at(&store, b"ddd", &owner_b, 400).await;
 
         let query = |cursor, limit, since, until| ListQuery {
-            pubkey: "pk1".to_string(),
+            pubkey: owner_a.clone(),
             cursor,
             limit,
             since,
@@ -992,7 +1833,7 @@ mod tests {
 
         let other_pubkey = store
             .list(ListQuery {
-                pubkey: "pk2".to_string(),
+                pubkey: owner_b.clone(),
                 cursor: None,
                 limit: 10,
                 since: None,
@@ -1004,14 +1845,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pages_across_an_uploaded_tie() {
+        let (store, _dir) = open_store(1024).await;
+        let owner = pubkey(0x11);
+        let mut all = Vec::new();
+        for bytes in [b"aaa".as_slice(), b"bbb", b"ccc", b"ddd"] {
+            all.push(put_at(&store, bytes, &owner, 500).await.sha256);
+        }
+
+        let query = |cursor| ListQuery {
+            pubkey: owner.clone(),
+            cursor,
+            limit: 2,
+            since: None,
+            until: None,
+        };
+
+        // Every blob shares `uploaded = 500`, so paging exercises the
+        // `(uploaded = ? AND sha256 < ?)` keyset branch.
+        let page1 = store.list(query(None)).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        let page2 = store.list(query(Some(page1[1].sha256))).await.unwrap();
+        assert_eq!(page2.len(), 2);
+
+        let mut seen = hashes(&page1);
+        seen.extend(hashes(&page2));
+        seen.sort();
+        all.sort();
+        assert_eq!(seen, all);
+    }
+
+    #[tokio::test]
     async fn list_with_unknown_cursor_returns_no_rows() {
         let (store, _dir) = open_store(1024).await;
-        put_at(&store, b"aaa", "pk1", 100).await;
+        put_at(&store, b"aaa", &pubkey(0x11), 100).await;
 
         let page = store
             .list(ListQuery {
-                pubkey: "pk1".to_string(),
+                pubkey: pubkey(0x11),
                 cursor: Some(hash_of(HELLO_WORLD_HASH)),
+                limit: 10,
+                since: None,
+                until: None,
+            })
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cursor_from_another_owner_is_not_honoured() {
+        let (store, _dir) = open_store(1024).await;
+        put_at(&store, b"aaa", &pubkey(0x11), 100).await;
+        let theirs = put_at(&store, b"bbb", &pubkey(0x22), 200).await;
+
+        let page = store
+            .list(ListQuery {
+                pubkey: pubkey(0x11),
+                cursor: Some(theirs.sha256),
                 limit: 10,
                 since: None,
                 until: None,
@@ -1024,12 +1915,13 @@ mod tests {
     #[tokio::test]
     async fn list_breaks_uploaded_ties_by_hash_descending() {
         let (store, _dir) = open_store(1024).await;
-        put_at(&store, b"aaa", "pk1", 500).await;
-        put_at(&store, b"bbb", "pk1", 500).await;
+        let owner = pubkey(0x11);
+        put_at(&store, b"aaa", &owner, 500).await;
+        put_at(&store, b"bbb", &owner, 500).await;
 
         let page = store
             .list(ListQuery {
-                pubkey: "pk1".to_string(),
+                pubkey: owner,
                 cursor: None,
                 limit: 10,
                 since: None,
@@ -1043,26 +1935,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_report_blocks_every_reported_hash() {
+    async fn list_clamps_a_limit_above_the_maximum() {
         let (store, _dir) = open_store(1024).await;
-        let reported_a = hash_of(HELLO_WORLD_HASH);
-        let reported_b = hash_of(ABC_HASH);
-        let unrelated = Sha256::from_bytes([0x42; 32]);
+        let owner = pubkey(0x11);
+        for i in 0..101u32 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let meta = BlobMeta {
+                sha256: Sha256::from_bytes(bytes),
+                size: 1,
+                mime: MimeType::octet_stream(),
+                uploaded: 1,
+                owner: Some(owner.clone()),
+            };
+            store.inner.insert(&meta).unwrap();
+        }
 
-        store
-            .save_report(ReportRecord {
-                hashes: vec![reported_a, reported_b],
-                reporter: "reporter".to_string(),
-                kind: "malware".to_string(),
-                content: "bad blob".to_string(),
-                created_at: 123,
+        let page = store
+            .list(ListQuery {
+                pubkey: owner,
+                cursor: None,
+                limit: 10_000,
+                since: None,
+                until: None,
             })
             .await
             .unwrap();
-
-        assert!(store.is_blocked(&reported_a).await.unwrap());
-        assert!(store.is_blocked(&reported_b).await.unwrap());
-        assert!(!store.is_blocked(&unrelated).await.unwrap());
+        assert_eq!(page.len(), MAX_LIST_LIMIT as usize);
     }
 
     #[tokio::test]
@@ -1088,36 +1987,122 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_of_the_same_blob_create_exactly_once() {
-        use std::sync::Arc as StdArc;
-
         const PUTS: usize = 8;
-        let (store, _dir) = open_store(1024 * 1024).await;
-        let store = StdArc::new(store);
-        let barrier = StdArc::new(Barrier::new(PUTS + 1));
+        let (store, dir) = open_store(1024 * 1024).await;
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(PUTS + 1));
 
         let mut tasks = Vec::new();
-        for _ in 0..PUTS {
-            let store = StdArc::clone(&store);
-            let barrier = StdArc::clone(&barrier);
+        for i in 0..PUTS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let owner = pubkey(i as u8 + 1);
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                store
-                    .put(body(b"hello world"), PutOptions::default())
+                let outcome = store
+                    .put(
+                        body(b"hello world"),
+                        PutOptions {
+                            owner: Some(owner),
+                            ..Default::default()
+                        },
+                    )
                     .await
-                    .unwrap()
+                    .unwrap();
+                outcome
             }));
         }
         barrier.wait().await;
 
-        let mut created = 0;
-        let mut existed = 0;
+        let mut outcomes = Vec::new();
         for task in tasks {
-            match task.await.unwrap() {
-                PutOutcome::Created(_) => created += 1,
-                PutOutcome::Existed(_) => existed += 1,
-            }
+            outcomes.push(task.await.unwrap());
         }
-        assert_eq!(created, 1);
-        assert_eq!(existed, PUTS - 1);
+
+        let created = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PutOutcome::Created(_)))
+            .count();
+        assert_eq!(created, 1, "exactly one put must create the row");
+
+        // The winner's owner is canonical; every outcome must agree.
+        let canonical = outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                PutOutcome::Created(meta) | PutOutcome::Existed(meta) => meta.owner.clone(),
+            })
+            .next()
+            .unwrap();
+        for outcome in &outcomes {
+            let meta = match outcome {
+                PutOutcome::Created(meta) | PutOutcome::Existed(meta) => meta,
+            };
+            assert_eq!(meta.owner, canonical);
+        }
+
+        // Exactly one file and one row survive the race.
+        let hash = hash_of(HELLO_WORLD_HASH);
+        assert_eq!(count_files(&dir.path().join("blobs")), 1);
+        assert_eq!(count_files(&dir.path().join("tmp")), 0);
+        let rows = store
+            .list(ListQuery {
+                pubkey: canonical.unwrap(),
+                cursor: None,
+                limit: 10,
+                since: None,
+                until: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sha256, hash);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_during_put_never_leaves_a_row_without_a_file() {
+        let (store, _dir) = open_store(1024 * 1024).await;
+        let store = Arc::new(store);
+        let hash = hash_of(HELLO_WORLD_HASH);
+        let owner = pubkey(0x11);
+
+        let put = {
+            let store = Arc::clone(&store);
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                store
+                    .put(
+                        body(b"hello world"),
+                        PutOptions {
+                            owner: Some(owner),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        let delete = {
+            let store = Arc::clone(&store);
+            let owner = owner.clone();
+            tokio::spawn(async move { store.delete(&hash, &owner).await })
+        };
+
+        let put = put.await.unwrap().unwrap();
+        let delete = delete.await.unwrap().unwrap();
+
+        assert!(matches!(
+            put,
+            PutOutcome::Created(_) | PutOutcome::Existed(_)
+        ));
+        // The delete either saw the blob (Deleted) or raced ahead of it
+        // (NotFound); it never sees a half-built blob.
+        assert!(matches!(
+            delete,
+            DeleteOutcome::Deleted | DeleteOutcome::NotFound
+        ));
+
+        // Invariant: a row never outlives its file.
+        let row = store.meta(&hash).await.unwrap();
+        let file = store.inner.blob_path(&hash).exists();
+        assert_eq!(row.is_some(), file, "row and file must agree");
     }
 }
