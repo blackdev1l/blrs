@@ -12,7 +12,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"
-IMAGE="${BLOSSOM_RUST_IMAGE:-rust:1-bookworm}"
+IMAGE="${BLOSSOM_RUST_IMAGE:-blrs-rust:1}"
+
+# The upstream `rust` image ships without clippy, which this project gates on,
+# and without the aarch64 cross toolchain. `docker/Dockerfile` adds both.
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  if [ "$IMAGE" = "blrs-rust:1" ]; then
+    echo "dcargo: building $IMAGE (one time)" >&2
+    docker build -t "$IMAGE" "$ROOT/docker" >&2
+  else
+    echo "dcargo: image $IMAGE not found" >&2
+    exit 1
+  fi
+fi
 
 # A shared registry volume avoids re-downloading crates on every invocation.
 # The target volume is keyed to this checkout so worktrees do not collide.
