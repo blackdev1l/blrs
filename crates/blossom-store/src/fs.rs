@@ -5,8 +5,8 @@ use blossom_core::sha256::Sha256;
 
 use crate::error::StoreError;
 use crate::traits::{
-    BlobMeta, BlobReader, BlobStore, DeleteOutcome, ListQuery, PutOptions, PutOutcome, ReportRecord,
-    StoreConfig,
+    BlobMeta, BlobReader, BlobStore, DeleteOutcome, ListQuery, PutOptions, PutOutcome,
+    ReportRecord, StoreConfig,
 };
 
 /// A filesystem blob store with a SQLite metadata index.

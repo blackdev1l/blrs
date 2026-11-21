@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
 use blossom_core::auth::Action;
+use clap::{Parser, ValueEnum};
 
 /// Which endpoints require a BUD-11 authorization token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -100,7 +100,11 @@ struct Cli {
     #[arg(long, env = "BLOSSOM_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
 
-    #[arg(long, env = "BLOSSOM_PUBLIC_URL", default_value = "http://localhost:3000")]
+    #[arg(
+        long,
+        env = "BLOSSOM_PUBLIC_URL",
+        default_value = "http://localhost:3000"
+    )]
     public_url: String,
 
     /// Largest single blob accepted, in bytes.
@@ -124,7 +128,11 @@ struct Cli {
     #[arg(long, env = "BLOSSOM_MIRROR_ALLOW_PRIVATE", default_value_t = false)]
     mirror_allow_private: bool,
 
-    #[arg(long = "blocked-mime", env = "BLOSSOM_BLOCKED_MIME", value_delimiter = ',')]
+    #[arg(
+        long = "blocked-mime",
+        env = "BLOSSOM_BLOCKED_MIME",
+        value_delimiter = ','
+    )]
     blocked_mime: Vec<String>,
 }
 

@@ -35,9 +35,16 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(handlers::get_index))
-        .route("/upload", on(MethodFilter::PUT, handlers::put_upload).on(MethodFilter::HEAD, handlers::head_upload))
+        .route(
+            "/upload",
+            on(MethodFilter::PUT, handlers::put_upload)
+                .on(MethodFilter::HEAD, handlers::head_upload),
+        )
         .route("/mirror", on(MethodFilter::PUT, handlers::put_mirror))
-        .route("/media", on(MethodFilter::PUT, handlers::put_media).on(MethodFilter::HEAD, handlers::head_media))
+        .route(
+            "/media",
+            on(MethodFilter::PUT, handlers::put_media).on(MethodFilter::HEAD, handlers::head_media),
+        )
         .route("/report", on(MethodFilter::PUT, handlers::put_report))
         .route("/list/{pubkey}", get(handlers::get_list))
         .route(
@@ -51,5 +58,6 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// The `Access-Control-Allow-Headers` value BUD-01 requires.
-pub const CORS_ALLOW_HEADERS: HeaderValue =
-    HeaderValue::from_static("Authorization, Content-Type, Range, X-SHA-256, X-Content-Type, X-Content-Length");
+pub const CORS_ALLOW_HEADERS: HeaderValue = HeaderValue::from_static(
+    "Authorization, Content-Type, Range, X-SHA-256, X-Content-Type, X-Content-Length",
+);

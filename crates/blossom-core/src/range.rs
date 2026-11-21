@@ -128,24 +128,42 @@ mod tests {
 
     #[test]
     fn start_at_or_past_end_is_unsatisfiable() {
-        assert_eq!(parse_range(Some("bytes=1000-"), 1000), RangeOutcome::Unsatisfiable);
-        assert_eq!(parse_range(Some("bytes=1000-1000"), 1000), RangeOutcome::Unsatisfiable);
+        assert_eq!(
+            parse_range(Some("bytes=1000-"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range(Some("bytes=1000-1000"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
     }
 
     #[test]
     fn zero_length_suffix_is_unsatisfiable() {
-        assert_eq!(parse_range(Some("bytes=-0"), 1000), RangeOutcome::Unsatisfiable);
+        assert_eq!(
+            parse_range(Some("bytes=-0"), 1000),
+            RangeOutcome::Unsatisfiable
+        );
     }
 
     #[test]
     fn any_range_on_empty_blob_is_unsatisfiable() {
-        assert_eq!(parse_range(Some("bytes=0-"), 0), RangeOutcome::Unsatisfiable);
-        assert_eq!(parse_range(Some("bytes=-500"), 0), RangeOutcome::Unsatisfiable);
+        assert_eq!(
+            parse_range(Some("bytes=0-"), 0),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-500"), 0),
+            RangeOutcome::Unsatisfiable
+        );
     }
 
     #[test]
     fn reversed_bounds_are_malformed() {
-        assert_eq!(parse_range(Some("bytes=500-100"), 1000), RangeOutcome::Malformed);
+        assert_eq!(
+            parse_range(Some("bytes=500-100"), 1000),
+            RangeOutcome::Malformed
+        );
     }
 
     #[test]
@@ -158,12 +176,18 @@ mod tests {
 
     #[test]
     fn unknown_unit_is_malformed() {
-        assert_eq!(parse_range(Some("items=0-99"), 1000), RangeOutcome::Malformed);
+        assert_eq!(
+            parse_range(Some("items=0-99"), 1000),
+            RangeOutcome::Malformed
+        );
     }
 
     #[test]
     fn non_numeric_or_empty_spec_is_malformed() {
-        assert_eq!(parse_range(Some("bytes=abc"), 1000), RangeOutcome::Malformed);
+        assert_eq!(
+            parse_range(Some("bytes=abc"), 1000),
+            RangeOutcome::Malformed
+        );
         assert_eq!(parse_range(Some("bytes="), 1000), RangeOutcome::Malformed);
     }
 

@@ -403,7 +403,10 @@ mod tests {
     fn verify_happy_path_returns_the_event_pubkey() {
         let event = signed_event(24242, NOW - 100, upload_tags(), "Upload Blob");
         let blob = Sha256::parse(X_HEX).unwrap();
-        assert_eq!(token(event).verify(upload_ctx(&blob)).unwrap().pubkey, BUD_PUBKEY);
+        assert_eq!(
+            token(event).verify(upload_ctx(&blob)).unwrap().pubkey,
+            BUD_PUBKEY
+        );
     }
 
     #[test]
@@ -432,7 +435,10 @@ mod tests {
         ];
         let event = signed_event(24242, NOW - 100, tags, "Upload Blob");
         let blob = Sha256::parse(X_HEX).unwrap();
-        assert_eq!(token(event).verify(upload_ctx(&blob)).unwrap().pubkey, BUD_PUBKEY);
+        assert_eq!(
+            token(event).verify(upload_ctx(&blob)).unwrap().pubkey,
+            BUD_PUBKEY
+        );
     }
 
     #[test]
