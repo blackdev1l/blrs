@@ -13,6 +13,7 @@
 
 mod error;
 mod fs;
+mod index;
 mod traits;
 
 pub use error::StoreError;
