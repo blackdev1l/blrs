@@ -98,7 +98,8 @@ impl AuthToken {
     /// Decodes an `Authorization: Nostr <base64url-no-pad json>` header value.
     pub fn from_authorization_header(value: &str) -> Result<Self, AuthError> {
         let (scheme, token) = value.split_once(' ').ok_or(AuthError::BadScheme)?;
-        if scheme != "Nostr" {
+        // RFC 7235 section 2.1: the auth scheme name is case-insensitive.
+        if !scheme.eq_ignore_ascii_case("Nostr") {
             return Err(AuthError::BadScheme);
         }
         let bytes = URL_SAFE_NO_PAD
@@ -365,6 +366,17 @@ mod tests {
         assert_eq!(
             AuthToken::from_authorization_header("Bearer x"),
             Err(AuthError::BadScheme)
+        );
+    }
+
+    #[test]
+    fn from_authorization_header_accepts_scheme_case_insensitively() {
+        // RFC 7235 section 2.1: the auth scheme name is case-insensitive.
+        let json = serde_json::to_vec(&bud_event()).unwrap();
+        let header = format!("nostr {}", URL_SAFE_NO_PAD.encode(json));
+        assert_eq!(
+            AuthToken::from_authorization_header(&header).unwrap(),
+            token(bud_event())
         );
     }
 
