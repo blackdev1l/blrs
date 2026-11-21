@@ -1,0 +1,23 @@
+[package]
+name = "blossom-store"
+description = "Content-addressed blob storage and metadata index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+blossom-core = { version = "0.1.0", path = "../blossom-core" }
+bytes = "1.12.2"
+futures-util = "0.3.34"
+hex = "0.4.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.10.9"
+thiserror = "2.0.20"
+tokio = { version = "1.53.3", features = ["rt", "fs", "io-util", "sync", "macros"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["full"] }
