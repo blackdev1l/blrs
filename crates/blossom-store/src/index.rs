@@ -9,8 +9,12 @@
 /// Schema applied on every open; each statement is idempotent.
 ///
 /// - `blobs` is keyed by the blob hash, so a re-upload is a lookup, not a write.
-/// - `reports` keeps NIP-56 reports for operator review (BUD-09).
-/// - `blocklist` records hashes moderation has removed, to prevent re-upload.
+/// - `reports` keeps NIP-56 reports for operator review (BUD-09). Reporting is
+///   kept separate from removal: a report never blocks, and the unique key on
+///   `(sha256, reporter, created_at)` makes a repeat report a no-op instead of
+///   growing the table without bound.
+/// - `blocklist` records hashes moderation has removed, so `put` can refuse to
+///   rewrite them (BUD-09).
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -32,7 +36,8 @@ CREATE TABLE IF NOT EXISTS reports (
     reporter   TEXT NOT NULL,
     kind       TEXT NOT NULL,
     content    TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    UNIQUE (sha256, reporter, created_at)
 );
 CREATE INDEX IF NOT EXISTS reports_sha256 ON reports (sha256);
 

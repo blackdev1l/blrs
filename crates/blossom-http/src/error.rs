@@ -94,12 +94,19 @@ impl IntoResponse for HttpError {
 impl From<StoreError> for HttpError {
     fn from(err: StoreError) -> Self {
         let reason = err.reason();
+        // `StoreError` is `#[non_exhaustive]`, so the wildcard is required and
+        // a new variant can never break this build again.
         match err {
             StoreError::TooLarge => Self::payload_too_large(reason),
             StoreError::HashMismatch => Self::conflict(reason),
+            StoreError::Blocked => Self::forbidden(reason),
+            StoreError::BodyRead(_) => Self::bad_request(reason),
+            StoreError::IndexTask(_) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, reason),
+            StoreError::InvalidOwner | StoreError::InvalidRange => Self::bad_request(reason),
             StoreError::Index(_) | StoreError::Corrupt(_) | StoreError::Io(_) => {
                 Self::unavailable(reason)
             }
+            _ => Self::unavailable(reason),
         }
     }
 }

@@ -232,15 +232,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blossom-core",
- "bytes",
- "futures-util",
- "hex",
  "rusqlite",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
