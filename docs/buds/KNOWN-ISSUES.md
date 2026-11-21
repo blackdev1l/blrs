@@ -53,3 +53,18 @@ rendered, is rejected with `BadEventId` — which is the correct behaviour.
 The test vector in `crates/blossom-core/src/auth.rs` therefore uses the four-tag
 reconstruction. Its expected id comes from the upstream document itself, so the
 test still has an independent source of truth.
+
+**4. The example's `content` violates BUD-11's own MUST.** BUD-11 says every
+authorization token "MUST have the `content` set to a human readable string
+explaining intended use to the user", but the worked example has
+`"content": ""`. A server that enforced that MUST would reject the specification's
+own example, so this server does not enforce it. Treating `content` as advisory
+is the interoperable reading.
+
+## Verification
+
+Every claim above was reproduced independently rather than taken on trust: the
+digests were recomputed with a standalone sha256 of the NIP-01 canonical array,
+and the `publkey` misspelling and the `//` comment are visible in the
+base64url-decoded header. See the test module in
+`crates/blossom-core/src/auth.rs` for the four-tag vector.
