@@ -10,6 +10,9 @@ name: release
 on:
   push:
     branches: [main]
+  # A pull request runs `verify` only; the build and release jobs are gated on
+  # the event below so a PR can never publish a release.
+  pull_request:
   workflow_dispatch:
 
 # Serialised per ref, and never cancelled: a run that already published some
@@ -46,6 +49,8 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     needs: verify
+    # A pull request stops at `verify`: it must not publish artifacts.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     container: rust:1-bullseye
     # Same `sh`-vs-`bash` trap as `verify`: packaging is a bash script.
@@ -141,6 +146,7 @@ jobs:
   build-windows:
     name: build x86_64-pc-windows-msvc
     needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -182,6 +188,7 @@ jobs:
   release:
     name: release
     needs: [build, build-windows]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
