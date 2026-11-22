@@ -107,6 +107,10 @@ pub struct StoreConfig {
     pub data_dir: PathBuf,
     /// Hard ceiling on a single blob, enforced while streaming.
     pub max_blob_size: u64,
+    /// Total committed blob bytes allowed across all owners, or `None` for no
+    /// limit. In-flight uploads are counted against the same budget until they
+    /// finish or are abandoned.
+    pub max_total_bytes: Option<u64>,
 }
 
 /// The storage seam.
@@ -163,4 +167,11 @@ pub trait BlobStore: Send + Sync + 'static {
 
     /// Whether a hash has been blocked by moderation (BUD-09).
     async fn is_blocked(&self, hash: &Sha256) -> Result<bool, StoreError>;
+
+    /// Whether a new blob of `size` bytes would fit under the configured total
+    /// disk budget. Advisory: the authoritative check happens at insert, and
+    /// deduplication (a blob that already exists) never needs this check because
+    /// it consumes no new space. `HEAD /upload` uses it to tell a client before
+    /// it uploads (BUD-06). Returns `true` when no budget is configured.
+    async fn has_quota_room(&self, size: u64) -> Result<bool, StoreError>;
 }

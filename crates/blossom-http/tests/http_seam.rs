@@ -44,6 +44,7 @@ fn base_config() -> Config {
         public_base: format!("https://{HOST}"),
         host: HOST.to_string(),
         max_blob_size: 4096,
+        max_total_bytes: None,
         auth: AuthPolicy::for_mode(AuthMode::Writes),
         enable_list: true,
         enable_mirror: true,
@@ -60,6 +61,7 @@ async fn harness(config: Config) -> (AppState, tempfile::TempDir) {
     let store = FsBlobStore::open(StoreConfig {
         data_dir: config.data_dir.clone(),
         max_blob_size: config.max_blob_size,
+        max_total_bytes: config.max_total_bytes,
     })
     .await
     .unwrap();
@@ -631,6 +633,48 @@ async fn head_upload_refusals_map_to_411_413_and_415() {
     )
     .await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn upload_and_head_upload_return_429_when_the_budget_is_full() {
+    let mut config = base_config();
+    config.auth = AuthPolicy::for_mode(AuthMode::None);
+    config.max_total_bytes = Some(16);
+    let (state, _dir) = harness(config).await;
+
+    // Fill the budget with one 11-byte blob.
+    seed(&state, b"hello world", Some("text/plain"), None).await;
+
+    // A different 11-byte blob would push the total over 16 bytes.
+    let (status, headers, _) = send(
+        &state,
+        request(
+            "PUT",
+            "/upload",
+            &[("content-type", "text/plain")],
+            b"abcdefghijk".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(header(&headers, "x-reason")
+        .to_ascii_lowercase()
+        .contains("quota"));
+
+    // BUD-06: the pre-flight reports the same refusal before the body is sent.
+    let (status, headers, body) = send(
+        &state,
+        head_request(
+            "/upload",
+            &[("x-content-type", "text/plain"), ("x-content-length", "11")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(header(&headers, "x-reason")
+        .to_ascii_lowercase()
+        .contains("quota"));
+    assert!(body.is_empty());
 }
 
 // ---------------------------------------------------------------------------

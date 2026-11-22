@@ -27,7 +27,9 @@ use blossom_core::range::{parse_range, RangeOutcome};
 use blossom_core::sha256::Sha256;
 use blossom_core::AuthError;
 use blossom_core::{BlobDescriptor, MimeType};
-use blossom_store::{BlobMeta, DeleteOutcome, ListQuery, PutOptions, PutOutcome, ReportRecord};
+use blossom_store::{
+    BlobMeta, DeleteOutcome, ListQuery, PutOptions, PutOutcome, ReportRecord, StoreError,
+};
 
 use crate::error::HttpError;
 use crate::mirror::{self, MirrorError};
@@ -509,6 +511,17 @@ async fn preflight(
         if state.store.is_blocked(hash).await? {
             return Err(HttpError::forbidden("Blob is blocked by server policy"));
         }
+        // Deduplication is free: a blob that is already stored consumes no new
+        // space, so an exhausted budget must not refuse its re-upload.
+        if state.store.meta(hash).await?.is_some() {
+            return Ok(StatusCode::OK.into_response());
+        }
+    }
+    // BUD-06 exists so a client is told before it uploads. Mirror the store's
+    // admission check here rather than letting it discover the full disk only
+    // after sending the body.
+    if !state.store.has_quota_room(length).await? {
+        return Err(StoreError::QuotaExceeded.into());
     }
     Ok(StatusCode::OK.into_response())
 }

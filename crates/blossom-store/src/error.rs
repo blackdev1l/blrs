@@ -32,6 +32,9 @@ pub enum StoreError {
     /// The hash is on the blocklist (BUD-09): re-upload and rewrite are refused.
     #[error("blob hash is blocked")]
     Blocked,
+    /// Storing the blob would push the total disk budget over its limit.
+    #[error("total disk quota is exhausted")]
+    QuotaExceeded,
     /// The index worker task failed (for example its thread panicked), so the
     /// query result is unknown. Distinct from [`StoreError::Corrupt`], which is
     /// about a blob file on disk.
@@ -52,6 +55,7 @@ impl StoreError {
             StoreError::TooLarge => "Request exceeds the maximum allowed size",
             StoreError::HashMismatch => "Body hash does not match the expected sha256",
             StoreError::Blocked => "Blob is blocked by server policy",
+            StoreError::QuotaExceeded => "Total disk quota is exhausted",
             StoreError::InvalidOwner => "Owner must be 64-character lowercase hex",
             StoreError::InvalidRange => "Requested range is outside the blob",
             StoreError::BodyRead(_) => "Could not read the request body",

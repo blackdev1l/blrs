@@ -84,6 +84,7 @@ enum Admitted {
     /// existed.
     Inserted(usize),
     Blocked,
+    QuotaExceeded,
 }
 
 /// A filesystem blob store with a SQLite metadata index.
@@ -112,6 +113,12 @@ struct Inner {
     tmp_dir: PathBuf,
     /// Monotonic suffix that makes concurrent temp files unique.
     tmp_seq: AtomicU64,
+    /// Committed blob bytes. Seeded from the index in `open` and kept current
+    /// by insert and delete, so the advisory quota checks are O(1).
+    used: AtomicU64,
+    /// Bytes reserved by uploads that are currently streaming, so concurrent
+    /// uploads cannot overshoot the total budget.
+    inflight: AtomicU64,
     /// Per-hash-bucket locks serializing `put` and `delete` for one hash.
     locks: Vec<tokio::sync::Mutex<()>>,
     /// Rows re-inserted by the reconciliation pass in `open`.
@@ -164,18 +171,68 @@ impl Inner {
     }
 
     /// The authoritative admission, run while the caller holds the per-hash
-    /// lock and the blob file is already in place: refuses a blocked hash, then
-    /// inserts the row, all in one transaction. A refusal is rolled back by the
-    /// caller removing the file.
+    /// lock and the blob file is already in place: refuses a blocked hash or an
+    /// insert that would push the committed total over the budget, then inserts
+    /// the row, all in one transaction. A refusal is rolled back by the caller
+    /// removing the file.
     fn insert_admitted(&self, meta: &BlobMeta) -> Result<Admitted, StoreError> {
         let mut conn = self.lock();
+        let limit = self.config.max_total_bytes;
         let tx = conn.transaction()?;
         if hash_blocked(&tx, &meta.sha256)? {
             return Ok(Admitted::Blocked);
         }
+        if let Some(limit) = limit {
+            let total: i64 =
+                tx.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+                    row.get(0)
+                })?;
+            let total = u64::try_from(total).unwrap_or(0);
+            if total.saturating_add(meta.size) > limit {
+                return Ok(Admitted::QuotaExceeded);
+            }
+        }
         let changed = insert_meta(&tx, meta)?;
         tx.commit()?;
         Ok(Admitted::Inserted(changed))
+    }
+
+    /// Whether `additional` more committed bytes fit, using the live counters.
+    /// This is the advisory check before a body and the streaming check that
+    /// bounds `tmp/`.
+    fn has_room(&self, additional: u64) -> bool {
+        match self.config.max_total_bytes {
+            None => true,
+            Some(limit) => {
+                self.used
+                    .load(Ordering::Relaxed)
+                    .saturating_add(self.inflight.load(Ordering::Relaxed))
+                    .saturating_add(additional)
+                    <= limit
+            }
+        }
+    }
+
+    /// The streaming form of [`Self::has_room`]: our own reservation already
+    /// supplies this upload's floor in `inflight`, so only the bytes actually
+    /// written are added on top of the other uploads' reservations. That stops
+    /// a client that lies about `Content-Length` without double-counting a
+    /// well-behaved one.
+    fn within_budget(&self, own_reserved: u64, written: u64) -> bool {
+        match self.config.max_total_bytes {
+            None => true,
+            Some(limit) => {
+                let others = self
+                    .inflight
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(own_reserved);
+                self.used
+                    .load(Ordering::Relaxed)
+                    .saturating_add(others)
+                    .saturating_add(written)
+                    <= limit
+            }
+        }
     }
 
     /// Test-only: pauses a put at the admission boundary until the test resumes
@@ -245,12 +302,17 @@ impl FsBlobStore {
             conn.execute_batch(SCHEMA)?;
             sweep_tmp(&tmp_dir);
             let reconciled = reconcile(&conn, &blobs_dir);
+            // Recompute the committed total from the index so the counter
+            // cannot drift across crashes, then keep it current in memory.
+            let used = total_blob_bytes(&conn)?;
             Ok(Inner {
                 config,
                 conn: Mutex::new(conn),
                 blobs_dir,
                 tmp_dir,
                 tmp_seq: AtomicU64::new(0),
+                used: AtomicU64::new(used),
+                inflight: AtomicU64::new(0),
                 locks: (0..HASH_BUCKETS)
                     .map(|_| tokio::sync::Mutex::new(()))
                     .collect(),
@@ -326,25 +388,33 @@ impl FsBlobStore {
             if declared > max {
                 return Err(StoreError::TooLarge);
             }
+            // Advisory early refusal: the cheapest place to reject a put that
+            // cannot fit, before any of the body is read.
+            if !self.inner.has_room(declared) {
+                return Err(StoreError::QuotaExceeded);
+            }
         }
 
         let tmp_path = self.inner.new_tmp_path();
         // From here on every exit path — an error or a cancelled future —
-        // removes the temp file; only a successful rename disarms the guard.
-        let mut guard = TempGuard::new(tmp_path.clone());
+        // removes the temp file and releases the reserved budget; only a
+        // successful rename disarms the file removal.
+        let reserved = declared_size.unwrap_or(max);
+        let mut guard = TempGuard::new(tmp_path.clone(), Arc::clone(&self.inner), reserved);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp_path)
             .await?;
 
-        let (hash, head, size) = match stream_body(&mut *body, &mut file, max).await {
-            Ok(streamed) => streamed,
-            Err(err) => {
-                drop(file);
-                return Err(err);
-            }
-        };
+        let (hash, head, size) =
+            match stream_body(&mut *body, &mut file, max, &self.inner, reserved).await {
+                Ok(streamed) => streamed,
+                Err(err) => {
+                    drop(file);
+                    return Err(err);
+                }
+            };
 
         if let Some(expected) = expected {
             if hash != expected {
@@ -428,7 +498,10 @@ impl FsBlobStore {
         };
 
         match admitted {
-            Admitted::Inserted(1) => Ok(PutOutcome::Created(meta)),
+            Admitted::Inserted(1) => {
+                self.inner.used.fetch_add(size, Ordering::Relaxed);
+                Ok(PutOutcome::Created(meta))
+            }
             Admitted::Inserted(_) => {
                 // Another writer committed first; its owner and timestamp are
                 // the canonical ones.
@@ -442,6 +515,10 @@ impl FsBlobStore {
             Admitted::Blocked => {
                 let _ = tokio::fs::remove_file(&dest).await;
                 Err(StoreError::Blocked)
+            }
+            Admitted::QuotaExceeded => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                Err(StoreError::QuotaExceeded)
             }
         }
     }
@@ -540,6 +617,10 @@ impl BlobStore for FsBlobStore {
         if changed == 0 {
             return Ok(DeleteOutcome::NotFound);
         }
+        // The row was counted when it was inserted (or seeded from the index),
+        // so this cannot underflow.
+        self.inner.used.fetch_sub(meta.size, Ordering::Relaxed);
+
         // Only now unlink the file, and fsync the shard so the removal is
         // durable. A missing file is fine: the row is already gone.
         match tokio::fs::remove_file(self.inner.blob_path(hash)).await {
@@ -569,22 +650,36 @@ impl BlobStore for FsBlobStore {
         let hash = *hash;
         blocking(move || inner.blocked(&hash)).await
     }
+
+    async fn has_quota_room(&self, size: u64) -> Result<bool, StoreError> {
+        Ok(self.inner.has_room(size))
+    }
 }
 
-/// Deletes an in-progress temp file unless it has been disarmed.
+/// Deletes an in-progress temp file unless it has been disarmed, and releases
+/// the budget it reserved.
 ///
-/// `put` arms this as soon as it has a temp path and disarms it only after the
-/// file has been renamed into place, so a cancelled upload, a client abort, or
-/// any early return cannot leave `tmp/*.part` behind. `Drop` cannot await, so
-/// the removal is a blocking `std::fs::remove_file`.
+/// `put` arms this as soon as it has a temp path and disarms the file removal
+/// only after the file has been renamed into place, so a cancelled upload, a
+/// client abort, or any early return cannot leave `tmp/*.part` behind. The
+/// reservation is released on every exit path, disarmed or not. `Drop` cannot
+/// await, so the removal is a blocking `std::fs::remove_file`.
 struct TempGuard {
     path: PathBuf,
     armed: bool,
+    inner: Arc<Inner>,
+    reserved: u64,
 }
 
 impl TempGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+    fn new(path: PathBuf, inner: Arc<Inner>, reserved: u64) -> Self {
+        inner.inflight.fetch_add(reserved, Ordering::Relaxed);
+        Self {
+            path,
+            armed: true,
+            inner,
+            reserved,
+        }
     }
 
     /// Keeps the temp file, called once it has been renamed into place.
@@ -598,6 +693,9 @@ impl Drop for TempGuard {
         if self.armed {
             let _ = std::fs::remove_file(&self.path);
         }
+        self.inner
+            .inflight
+            .fetch_sub(self.reserved, Ordering::Relaxed);
     }
 }
 
@@ -626,11 +724,16 @@ where
         .map_err(|err| StoreError::IndexTask(err.to_string()))?
 }
 
-/// Reads `body` to EOF in bounded chunks, hashing and writing as it goes.
+/// Reads `body` to EOF in bounded chunks, hashing and writing as it goes,
+/// aborting the moment the total budget would be exceeded. That streaming
+/// check is what stops a client that lies about `Content-Length` and bounds
+/// `tmp/` usage, not just the committed total.
 async fn stream_body(
     body: &mut (dyn AsyncRead + Send + Unpin),
     file: &mut File,
     max: u64,
+    inner: &Inner,
+    reserved: u64,
 ) -> Result<(Sha256, Vec<u8>, u64), StoreError> {
     let mut hasher = Sha2::new();
     let mut head = Vec::with_capacity(SNIFF_LEN);
@@ -646,6 +749,9 @@ async fn stream_body(
         total += read as u64;
         if total > max {
             return Err(StoreError::TooLarge);
+        }
+        if !inner.within_budget(reserved, total) {
+            return Err(StoreError::QuotaExceeded);
         }
         hasher.update(&buf[..read]);
         if head.len() < SNIFF_LEN {
@@ -927,6 +1033,15 @@ fn hash_blocked(conn: &Connection, hash: &Sha256) -> Result<bool, StoreError> {
     Ok(blocked)
 }
 
+/// The committed total of every indexed blob, used to seed the in-memory
+/// counter so it cannot drift across a crash.
+fn total_blob_bytes(conn: &Connection) -> Result<u64, StoreError> {
+    let total: i64 = conn.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+        row.get(0)
+    })?;
+    Ok(u64::try_from(total).unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::MetadataExt;
@@ -946,10 +1061,18 @@ mod tests {
     const ABC_HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     async fn open_store(max_blob_size: u64) -> (FsBlobStore, tempfile::TempDir) {
+        open_store_with(max_blob_size, None).await
+    }
+
+    async fn open_store_with(
+        max_blob_size: u64,
+        max_total_bytes: Option<u64>,
+    ) -> (FsBlobStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let config = StoreConfig {
             data_dir: dir.path().to_path_buf(),
             max_blob_size,
+            max_total_bytes,
         };
         let store = FsBlobStore::open(config).await.unwrap();
         (store, dir)
@@ -1478,6 +1601,8 @@ mod tests {
             assert_eq!(count_files(&tmp), 1);
         }
         assert_eq!(count_files(&tmp), 0);
+        // The cancelled upload also releases the budget it reserved.
+        assert_eq!(store.inner.inflight.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1519,6 +1644,7 @@ mod tests {
         let config = StoreConfig {
             data_dir: dir.path().to_path_buf(),
             max_blob_size: 1024,
+            max_total_bytes: None,
         };
 
         {
@@ -1554,6 +1680,7 @@ mod tests {
         let store = FsBlobStore::open(StoreConfig {
             data_dir: dir.path().to_path_buf(),
             max_blob_size: 1024,
+            max_total_bytes: None,
         })
         .await
         .unwrap();
@@ -1573,6 +1700,7 @@ mod tests {
         let config = StoreConfig {
             data_dir: dir.path().to_path_buf(),
             max_blob_size: 1024,
+            max_total_bytes: None,
         };
         let hash = hash_of(ABC_HASH);
         let hex = hash.to_hex();
@@ -2276,5 +2404,252 @@ mod tests {
             "a failed delete must leave the blob intact, not a row without a file"
         );
         assert!(row.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Total disk quota
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn put_within_total_budget_succeeds() {
+        let (store, _dir) = open_store_with(1024, Some(64)).await;
+
+        let outcome = store
+            .put(
+                body(b"hello world"),
+                PutOptions {
+                    declared_size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, PutOutcome::Created(_)));
+        assert_eq!(store.inner.used.load(Ordering::Relaxed), 11);
+        assert_eq!(store.inner.inflight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn put_exceeding_total_budget_is_refused() {
+        let (store, dir) = open_store_with(1024, Some(16)).await;
+        store
+            .put(
+                body(b"hello world"),
+                PutOptions {
+                    declared_size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .put(
+                body(b"abcdefghijk"),
+                PutOptions {
+                    declared_size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StoreError::QuotaExceeded));
+        assert_eq!(store.inner.used.load(Ordering::Relaxed), 11);
+        assert_eq!(count_files(&dir.path().join("blobs")), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_at_full_budget_is_free() {
+        let (store, _dir) = open_store_with(1024, Some(11)).await;
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(store.inner.used.load(Ordering::Relaxed), 11);
+
+        // The X-SHA-256 fast path answers before the quota is consulted.
+        let outcome = store
+            .put(
+                Box::new(FailReader),
+                PutOptions {
+                    expected: Some(hash_of(HELLO_WORLD_HASH)),
+                    declared_size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+        assert_eq!(store.inner.used.load(Ordering::Relaxed), 11);
+    }
+
+    #[tokio::test]
+    async fn delete_frees_total_budget() {
+        let (store, _dir) = open_store_with(1024, Some(11)).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        // The budget is full, so a different blob is refused...
+        let refused = store
+            .put(
+                body(b"abcdefghijk"),
+                PutOptions {
+                    declared_size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, StoreError::QuotaExceeded));
+
+        // ...until the first blob is deleted.
+        assert_eq!(
+            store.delete(&hash, "anyone").await.unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(store.inner.used.load(Ordering::Relaxed), 0);
+
+        let outcome = store
+            .put(
+                body(b"abcdefghijk"),
+                PutOptions {
+                    declared_size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Created(_)));
+    }
+
+    #[tokio::test]
+    async fn authoritative_insert_refuses_when_the_total_would_exceed() {
+        let (store, _dir) = open_store_with(1024, Some(16)).await;
+        let meta = |hash| BlobMeta {
+            sha256: hash,
+            size: 11,
+            mime: MimeType::octet_stream(),
+            uploaded: 1,
+            owner: None,
+        };
+
+        assert!(matches!(
+            store
+                .inner
+                .insert_admitted(&meta(hash_of(HELLO_WORLD_HASH))),
+            Ok(Admitted::Inserted(1))
+        ));
+        assert!(matches!(
+            store.inner.insert_admitted(&meta(hash_of(ABC_HASH))),
+            Ok(Admitted::QuotaExceeded)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_cannot_exceed_the_total_budget() {
+        let (store, _dir) = open_store_with(4096, Some(3000)).await;
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let mut tasks = Vec::new();
+        for i in 0..2usize {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                let data = patterned_bytes(2000 + i);
+                let declared = data.len() as u64;
+                barrier.wait().await;
+                store
+                    .put(
+                        body(&data),
+                        PutOptions {
+                            declared_size: Some(declared),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            // Both may fail, or one may win; neither may push the total over.
+            let _ = task.await.unwrap();
+        }
+
+        let total = store.inner.used.load(Ordering::Relaxed);
+        assert!(
+            total <= 3000,
+            "committed {total} bytes over a 3000-byte budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn lying_content_length_is_stopped_mid_stream() {
+        let (store, dir) = open_store_with(1 << 20, Some(1024)).await;
+        let produced = Arc::new(AtomicU64::new(0));
+        let reader = CountingReader {
+            remaining: 1 << 20,
+            produced: Arc::clone(&produced),
+        };
+
+        let err = store
+            .put(
+                Box::new(reader),
+                PutOptions {
+                    declared_size: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StoreError::QuotaExceeded));
+        let served = produced.load(Ordering::Relaxed);
+        assert!(
+            served <= 1024 + CHUNK as u64,
+            "the store read {served} bytes before stopping"
+        );
+        assert_eq!(count_files(&dir.path().join("tmp")), 0);
+        assert_eq!(store.inner.used.load(Ordering::Relaxed), 0);
+        assert_eq!(store.inner.inflight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn aborted_upload_releases_its_reservation() {
+        let (store, _dir) = open_store_with(1 << 20, Some(1024)).await;
+
+        // A client that declared a large body and then aborted must not leak
+        // its reservation against the budget.
+        let err = store
+            .put(
+                Box::new(ErrorReader { produced: false }),
+                PutOptions {
+                    declared_size: Some(900),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::BodyRead(_)));
+        assert_eq!(store.inner.inflight.load(Ordering::Relaxed), 0);
+
+        // This only fits if the reservation was released.
+        let outcome = store
+            .put(
+                body(&patterned_bytes(900)),
+                PutOptions {
+                    declared_size: Some(900),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Created(_)));
     }
 }
