@@ -137,12 +137,16 @@ pub trait BlobStore: Send + Sync + 'static {
 
     /// Opens a blob for reading, optionally restricted to `range`.
     ///
-    /// The stream is bounded to the row's `size`, so the bytes served always
-    /// match the advertised `Content-Length`. A `range` that is not fully
-    /// inside the blob is rejected with [`StoreError::InvalidRange`]. Returns
-    /// `Ok(None)` when no row exists. When a row exists but its blob file does
-    /// not, reading returns [`StoreError::Corrupt`]; `meta` still reports the
-    /// row, and a later `put` of the same bytes heals it.
+    /// The blob file's length is verified against the row's `size` before any
+    /// bytes are served, so the stream matches the advertised
+    /// `Content-Length`: for a whole-blob read the file length must equal
+    /// `size`, and for a range read the file must be long enough to cover the
+    /// range. A short or grown file is reported as [`StoreError::Corrupt`]. A
+    /// `range` that is not fully inside the blob is rejected with
+    /// [`StoreError::InvalidRange`]. Returns `Ok(None)` when no row exists.
+    /// When a row exists but its blob file does not, reading returns
+    /// [`StoreError::Corrupt`]; `meta` still reports the row, and a later
+    /// `put` of the same bytes heals it.
     async fn read(
         &self,
         hash: &Sha256,

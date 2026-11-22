@@ -569,8 +569,31 @@ impl BlobStore for FsBlobStore {
             Err(err) => return Err(err.into()),
         };
 
-        // Opening the file reads nothing: the returned stream stays lazy and is
-        // bounded to the row's size, so a file that grew cannot over-send.
+        // The HTTP layer advertises `meta.size` (or, for a range, a length that
+        // lies inside it), while `take` below is only an upper bound. Verify
+        // the file really holds those bytes, so a truncated or grown file
+        // cannot be served short of, or longer than, the advertised length.
+        let file_len = file.metadata().await?.len();
+        match range.as_ref() {
+            Some(range) if file_len <= range.end => {
+                return Err(StoreError::Corrupt(format!(
+                    "indexed blob {hash} is {file_len} bytes but range {}..={} needs {} bytes",
+                    range.start,
+                    range.end,
+                    range.end + 1
+                )));
+            }
+            None if file_len != meta.size => {
+                return Err(StoreError::Corrupt(format!(
+                    "indexed blob {hash} is {file_len} bytes but its row records {} bytes",
+                    meta.size
+                )));
+            }
+            _ => {}
+        }
+
+        // The returned stream stays lazy: opening the file read nothing, and
+        // the length check above makes `take` a bound that is actually met.
         let stream: Box<dyn AsyncRead + Send + Unpin> = match range {
             Some(range) => {
                 file.seek(SeekFrom::Start(range.start)).await?;
@@ -1792,7 +1815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_bounds_the_stream_to_the_indexed_size() {
+    async fn read_reports_corrupt_when_the_file_grew_past_its_row() {
         let (store, _dir) = open_store(1024).await;
         let hash = hash_of(HELLO_WORLD_HASH);
         store
@@ -1800,15 +1823,101 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate a file that grew past its row (corruption or a partial
-        // overwrite): the store must not serve more than `meta.size`.
+        // A grown file is corruption too: the row's size is the contract, so a
+        // longer file is not silently truncated into a valid body.
         let path = store.inner.blob_path(&hash);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.extend_from_slice(b"TRAILING GARBAGE");
         std::fs::write(&path, &bytes).unwrap();
 
-        let reader = store.read(&hash, None).await.unwrap().unwrap();
-        assert_eq!(read_all(reader).await, b"hello world");
+        let err = store
+            .read(&hash, None)
+            .await
+            .err()
+            .expect("a grown file must be reported");
+        assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    /// Shortens the blob file to `len` bytes in place, simulating a crash or
+    /// media corruption that lost the tail.
+    fn truncate_blob(path: &Path, len: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_reports_corrupt_when_the_file_is_shorter_than_its_row() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        // The row still records 11 bytes; the file now holds only 7.
+        truncate_blob(&store.inner.blob_path(&hash), 7);
+
+        let err = store
+            .read(&hash, None)
+            .await
+            .err()
+            .expect("a short file must be reported");
+        assert!(matches!(err, StoreError::Corrupt(_)));
+        let message = err.to_string();
+        assert!(message.contains(&hash.to_hex()), "{message}");
+        assert!(message.contains("11"), "{message}");
+        assert!(message.contains('7'), "{message}");
+    }
+
+    #[tokio::test]
+    async fn range_read_reports_corrupt_when_the_short_file_cannot_cover_it() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        // Row size is 11; the file now holds only 7 bytes.
+        truncate_blob(&store.inner.blob_path(&hash), 7);
+
+        let err = store
+            .read(&hash, Some(ByteRange { start: 0, end: 10 }))
+            .await
+            .err()
+            .expect("a range past the short file must be reported");
+        assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    #[tokio::test]
+    async fn range_read_succeeds_when_the_short_file_still_covers_the_range() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        truncate_blob(&store.inner.blob_path(&hash), 7);
+
+        // `0..=4` covers five bytes, which the seven-byte file still holds.
+        let reader = store
+            .read(&hash, Some(ByteRange { start: 0, end: 4 }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_all(reader).await, b"hello");
+    }
+
+    #[tokio::test]
+    async fn meta_still_reports_the_row_after_the_file_is_truncated() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        truncate_blob(&store.inner.blob_path(&hash), 7);
+
+        let meta = store.meta(&hash).await.unwrap().expect("row survives");
+        assert_eq!(meta.size, 11);
     }
 
     #[tokio::test]
