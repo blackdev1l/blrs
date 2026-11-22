@@ -53,5 +53,5 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 ## History
 
 This repo used local markdown under `.scratch/` before switching to GitHub
-Issues. `.scratch/disk-quota/` is retained only as the original spec for the
-total-disk-quota feature; everything filed from here on goes to GitHub.
+Issues. That directory has been removed; everything filed from here on goes to
+GitHub Issues.
