@@ -15,8 +15,10 @@
 //! - an upload that crashed after the rename but before the row insert leaves a
 //!   blob file with no row, which `open` re-indexes (the filename is the hash,
 //!   so the bytes are already valid);
-//! - a delete removes the file first and the row second, so a crash mid-delete
-//!   leaves an orphan file rather than a row pointing at a missing blob.
+//! - a delete commits its row delete and blocklist entry first and unlinks the
+//!   file second, so a crash mid-delete leaves an orphan file whose hash is
+//!   already blocked; `open` deletes that file rather than leaving a row
+//!   pointing at a missing blob.
 //!
 //! `open` never resurrects a hash that is on the blocklist.
 
@@ -68,6 +70,22 @@ const MAX_LIST_LIMIT: u32 = 100;
 /// A selected row from the `blobs` table, before validation.
 type RawMeta = (String, i64, String, i64, Option<String>);
 
+/// The state of a hash under the per-hash lock: blocked, indexed, or absent.
+enum Probe {
+    Blocked,
+    Existing(BlobMeta),
+    Absent,
+}
+
+/// The result of the authoritative, transactional admission in
+/// [`Inner::insert_admitted`].
+enum Admitted {
+    /// The insert ran; `1` means the row was created, `0` that it already
+    /// existed.
+    Inserted(usize),
+    Blocked,
+}
+
 /// A filesystem blob store with a SQLite metadata index.
 ///
 /// Layout under `data_dir`:
@@ -98,6 +116,10 @@ struct Inner {
     locks: Vec<tokio::sync::Mutex<()>>,
     /// Rows re-inserted by the reconciliation pass in `open`.
     reconciled: u64,
+    /// Test-only rendezvous that interleaves a delete between streaming and the
+    /// admission critical section. `None` in production.
+    #[cfg(test)]
+    put_gate: Mutex<Option<Arc<PutGate>>>,
 }
 
 impl Inner {
@@ -128,11 +150,46 @@ impl Inner {
         lookup_meta(&conn, hash)
     }
 
-    /// Inserts only when absent; the returned count is `1` for the writer that
-    /// created the row and `0` for every loser of the race.
-    fn insert(&self, meta: &BlobMeta) -> Result<usize, StoreError> {
+    /// Classifies `hash` against the blocklist and the index in one read, for a
+    /// single consistent snapshot the caller can act on.
+    fn probe(&self, hash: &Sha256) -> Result<Probe, StoreError> {
         let conn = self.lock();
-        insert_meta(&conn, meta)
+        if hash_blocked(&conn, hash)? {
+            return Ok(Probe::Blocked);
+        }
+        match lookup_meta(&conn, hash)? {
+            Some(meta) => Ok(Probe::Existing(meta)),
+            None => Ok(Probe::Absent),
+        }
+    }
+
+    /// The authoritative admission, run while the caller holds the per-hash
+    /// lock and the blob file is already in place: refuses a blocked hash, then
+    /// inserts the row, all in one transaction. A refusal is rolled back by the
+    /// caller removing the file.
+    fn insert_admitted(&self, meta: &BlobMeta) -> Result<Admitted, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if hash_blocked(&tx, &meta.sha256)? {
+            return Ok(Admitted::Blocked);
+        }
+        let changed = insert_meta(&tx, meta)?;
+        tx.commit()?;
+        Ok(Admitted::Inserted(changed))
+    }
+
+    /// Test-only: pauses a put at the admission boundary until the test resumes
+    /// it, so a delete can be interleaved deterministically.
+    #[cfg(test)]
+    async fn run_put_gate(&self) {
+        let gate = match self.put_gate.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.resume.notified().await;
+        }
     }
 
     /// Deletes the row and records the hash on the blocklist in one transaction.
@@ -198,6 +255,8 @@ impl FsBlobStore {
                     .map(|_| tokio::sync::Mutex::new(()))
                     .collect(),
                 reconciled,
+                #[cfg(test)]
+                put_gate: Mutex::new(None),
             })
         })
         .await?;
@@ -238,24 +297,31 @@ impl FsBlobStore {
             }
         }
 
-        // BUD-02 lets `X-SHA-256` be used for policy before persisting. This
-        // fast path runs before the declared-size check, so re-uploading a
-        // known blob answers `Existed` even if the client over-declared its
-        // `Content-Length`.
+        // BUD-02 lets `X-SHA-256` be used for policy before persisting. The
+        // whole check runs under the per-hash lock, so a concurrent delete
+        // cannot interleave between the blocklist/existence reads and the
+        // `Existed` answer. It runs before the declared-size check, so
+        // re-uploading a known blob answers `Existed` even if the client
+        // over-declared its `Content-Length`, and before the quota check,
+        // because deduplication consumes no new space.
         if let Some(expected) = expected {
-            if self.is_blocked(&expected).await? {
-                return Err(StoreError::Blocked);
-            }
-            if let Some(existing) = self.meta(&expected).await? {
-                // A row whose file is missing is not really stored: fall
-                // through so the streaming path can heal it.
-                if tokio::fs::try_exists(self.inner.blob_path(&expected)).await? {
-                    return Ok(PutOutcome::Existed(existing));
+            let lock = self.inner.keyed_lock(&expected);
+            let _lock = lock.lock().await;
+            let inner = Arc::clone(&self.inner);
+            match blocking(move || inner.probe(&expected)).await? {
+                Probe::Blocked => return Err(StoreError::Blocked),
+                Probe::Existing(existing) => {
+                    // A row whose file is missing is not really stored: fall
+                    // through so the streaming path can heal it.
+                    if tokio::fs::try_exists(self.inner.blob_path(&expected)).await? {
+                        return Ok(PutOutcome::Existed(existing));
+                    }
                 }
+                Probe::Absent => {}
             }
         }
 
-        // A declared size over the limit never needs the body at all.
+        // A declared size over the single-blob limit never needs the body.
         if let Some(declared) = declared_size {
             if declared > max {
                 return Err(StoreError::TooLarge);
@@ -287,12 +353,6 @@ impl FsBlobStore {
             }
         }
 
-        // Once the content is known, a blocklisted hash must be refused.
-        if self.is_blocked(&hash).await? {
-            drop(file);
-            return Err(StoreError::Blocked);
-        }
-
         // The hash is verified; only now make the bytes durable.
         let durable = async {
             file.flush().await?;
@@ -302,8 +362,12 @@ impl FsBlobStore {
         drop(file);
         durable?;
 
+        #[cfg(test)]
+        self.inner.run_put_gate().await;
+
         // Serialize the rest per hash so a concurrent delete cannot remove the
-        // file between the rename and the insert, or vice versa.
+        // file between the rename and the insert, or vice versa. Every check
+        // below runs inside this critical section, so nothing can interleave.
         let lock = self.inner.keyed_lock(&hash);
         let _lock = lock.lock().await;
 
@@ -312,16 +376,22 @@ impl FsBlobStore {
 
         // Re-uploading identical bytes: discard the temp copy instead of
         // rewriting the same bytes to the SD card and losing the original
-        // mtime. A row whose file is gone is healed instead.
-        if let Some(existing) = self.meta(&hash).await? {
-            if tokio::fs::try_exists(&dest).await? {
+        // mtime. A blocked hash is refused and a row whose file is gone is
+        // healed instead.
+        let inner = Arc::clone(&self.inner);
+        match blocking(move || inner.probe(&hash)).await? {
+            Probe::Blocked => return Err(StoreError::Blocked),
+            Probe::Existing(existing) => {
+                if tokio::fs::try_exists(&dest).await? {
+                    return Ok(PutOutcome::Existed(existing));
+                }
+                tokio::fs::create_dir_all(&shard).await?;
+                tokio::fs::rename(&tmp_path, &dest).await?;
+                guard.disarm();
+                sync_dir(&shard).await?;
                 return Ok(PutOutcome::Existed(existing));
             }
-            tokio::fs::create_dir_all(&shard).await?;
-            tokio::fs::rename(&tmp_path, &dest).await?;
-            guard.disarm();
-            sync_dir(&shard).await?;
-            return Ok(PutOutcome::Existed(existing));
+            Probe::Absent => {}
         }
 
         let mime = mime
@@ -344,20 +414,34 @@ impl FsBlobStore {
             owner,
         };
 
+        // The authoritative admission re-checks the blocklist and the committed
+        // total (against concurrent uploads of other hashes) and inserts the row
+        // in one transaction. A refusal rolls the renamed file back.
         let inner = Arc::clone(&self.inner);
         let candidate = meta.clone();
-        let changed = blocking(move || inner.insert(&candidate)).await?;
+        let admitted = match blocking(move || inner.insert_admitted(&candidate)).await {
+            Ok(admitted) => admitted,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(err);
+            }
+        };
 
-        if changed == 1 {
-            Ok(PutOutcome::Created(meta))
-        } else {
-            // Another writer committed first; its owner and timestamp are the
-            // canonical ones.
-            match self.meta(&hash).await? {
-                Some(existing) => Ok(PutOutcome::Existed(existing)),
-                None => Err(StoreError::IndexTask(
-                    "index row disappeared after insert".to_string(),
-                )),
+        match admitted {
+            Admitted::Inserted(1) => Ok(PutOutcome::Created(meta)),
+            Admitted::Inserted(_) => {
+                // Another writer committed first; its owner and timestamp are
+                // the canonical ones.
+                match self.meta(&hash).await? {
+                    Some(existing) => Ok(PutOutcome::Existed(existing)),
+                    None => Err(StoreError::IndexTask(
+                        "index row disappeared after insert".to_string(),
+                    )),
+                }
+            }
+            Admitted::Blocked => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                Err(StoreError::Blocked)
             }
         }
     }
@@ -445,21 +529,23 @@ impl BlobStore for FsBlobStore {
             }
         }
 
-        // Remove the file first, then the row, so a crash leaves an orphan file
-        // that `open` reconciles rather than a row pointing at nothing.
-        match tokio::fs::remove_file(self.inner.blob_path(hash)).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-
-        // BUD-09/12: a removed blob is blocked in the same transaction as the
-        // row delete, so it cannot be rewritten.
+        // BUD-09/12: commit the row delete and the blocklist entry together
+        // FIRST, so the hash is blocked before the file disappears. A crash
+        // then leaves an orphan file whose hash is already blocked, which
+        // `open` deletes; the inverse order could leave a row pointing at a
+        // missing blob that nothing repairs.
         let inner = Arc::clone(&self.inner);
         let owned = *hash;
         let changed = blocking(move || inner.remove_and_block(&owned)).await?;
         if changed == 0 {
             return Ok(DeleteOutcome::NotFound);
+        }
+        // Only now unlink the file, and fsync the shard so the removal is
+        // durable. A missing file is fine: the row is already gone.
+        match tokio::fs::remove_file(self.inner.blob_path(hash)).await {
+            Ok(()) => sync_dir(&self.inner.shard_dir(hash)).await?,
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
 
         Ok(DeleteOutcome::Deleted)
@@ -513,6 +599,16 @@ impl Drop for TempGuard {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// Test-only rendezvous: a put notifies `reached` and waits on `resume`, so a
+/// test can run a delete in the window between streaming and the admission
+/// critical section.
+#[cfg(test)]
+#[derive(Default)]
+struct PutGate {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 /// Runs a synchronous closure on the blocking pool.
@@ -1948,7 +2044,7 @@ mod tests {
                 uploaded: 1,
                 owner: Some(owner.clone()),
             };
-            store.inner.insert(&meta).unwrap();
+            store.inner.insert_admitted(&meta).unwrap();
         }
 
         let page = store
@@ -2104,5 +2200,81 @@ mod tests {
         let row = store.meta(&hash).await.unwrap();
         let file = store.inner.blob_path(&hash).exists();
         assert_eq!(row.is_some(), file, "row and file must agree");
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocklist resurrection race
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_between_streaming_and_admission_is_not_resurrected() {
+        let (store, _dir) = open_store(1024).await;
+        let store = Arc::new(store);
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        // Park the next put between streaming and the admission critical
+        // section, the exact window the old code left open.
+        let gate = Arc::new(PutGate::default());
+        *store.inner.put_gate.lock().unwrap() = Some(Arc::clone(&gate));
+
+        let put = {
+            let store = Arc::clone(&store);
+            tokio::spawn(
+                async move { store.put(body(b"hello world"), PutOptions::default()).await },
+            )
+        };
+        gate.reached.notified().await;
+
+        // The delete commits while the put is parked.
+        assert_eq!(
+            store.delete(&hash, "anyone").await.unwrap(),
+            DeleteOutcome::Deleted
+        );
+        gate.resume.notify_one();
+
+        let err = put.await.unwrap().unwrap_err();
+        assert!(matches!(err, StoreError::Blocked), "got {err:?}");
+        assert!(store.meta(&hash).await.unwrap().is_none());
+        assert!(!store.inner.blob_path(&hash).exists());
+        assert!(store.is_blocked(&hash).await.unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Delete order
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn failed_delete_commit_keeps_row_and_file_in_agreement() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        // Force the row-delete transaction to fail: reads still work, writes do
+        // not. The commit is the first step of a delete now, so a failure must
+        // leave the file untouched.
+        store
+            .inner
+            .lock()
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+
+        let err = store.delete(&hash, "anyone").await.unwrap_err();
+        assert!(matches!(err, StoreError::Index(_)));
+
+        let row = store.meta(&hash).await.unwrap();
+        let file = store.inner.blob_path(&hash).exists();
+        assert_eq!(
+            row.is_some(),
+            file,
+            "a failed delete must leave the blob intact, not a row without a file"
+        );
+        assert!(row.is_some());
     }
 }
