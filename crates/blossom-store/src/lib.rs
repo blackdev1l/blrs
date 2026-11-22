@@ -10,10 +10,11 @@
 //! non-successful exit (including a cancelled request) and `open` sweeps
 //! `tmp/*.part`; after the rename the shard directory is `fsync`ed before the
 //! index row is inserted; and `open` re-indexes any orphan blob file, skipping
-//! blocklisted hashes. A `DELETE` records the hash on the blocklist in the same
-//! transaction as its row delete and unlinks the file afterwards, so a removed
-//! blob cannot be rewritten (BUD-09) and a crash leaves an orphan file the next
-//! `open` removes rather than a row pointing at nothing.
+//! blocklisted hashes. A `DELETE` commits its row delete in one transaction,
+//! with a blocklist entry only when the requester owns the blob, and unlinks
+//! the file afterwards, so an owner-removed blob cannot be rewritten (BUD-09)
+//! and a crash leaves an orphan file the next `open` removes rather than a row
+//! pointing at nothing.
 //!
 //! `open` runs those recovery passes once per process: they assume the store is
 //! the only writer to `data_dir`, so a second `open` on a live store can delete

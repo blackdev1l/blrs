@@ -15,10 +15,12 @@
 //! - an upload that crashed after the rename but before the row insert leaves a
 //!   blob file with no row, which `open` re-indexes (the filename is the hash,
 //!   so the bytes are already valid);
-//! - a delete commits its row delete and blocklist entry first and unlinks the
-//!   file second, so a crash mid-delete leaves an orphan file whose hash is
-//!   already blocked; `open` deletes that file rather than leaving a row
-//!   pointing at a missing blob.
+//! - an owner-authorised delete commits its row delete and blocklist entry
+//!   first and unlinks the file second, so a crash mid-delete leaves an orphan
+//!   file whose hash is already blocked; `open` deletes that file rather than
+//!   leaving a row pointing at a missing blob. Deleting an ownerless blob
+//!   commits only the row delete and leaves the blocklist untouched, so the
+//!   hash stays re-uploadable.
 //!
 //! `open` never resurrects a hash that is on the blocklist.
 
@@ -262,10 +264,11 @@ impl Inner {
         }
     }
 
-    /// Deletes the row and records the hash on the blocklist in one transaction.
-    fn remove_and_block(&self, hash: &Sha256) -> Result<usize, StoreError> {
+    /// Deletes the row and, when `block` is set, records the hash on the
+    /// blocklist in the same transaction.
+    fn remove_meta(&self, hash: &Sha256, block: bool) -> Result<usize, StoreError> {
         let mut conn = self.lock();
-        delete_meta_and_block(&mut conn, hash)
+        delete_meta(&mut conn, hash, block)
     }
 
     fn list(&self, query: &ListQuery) -> Result<Vec<BlobMeta>, StoreError> {
@@ -649,20 +652,26 @@ impl BlobStore for FsBlobStore {
         // An ownerless blob is one stored while the server ran without auth;
         // anyone may delete it. A blob with an owner is only removable by that
         // owner, and a refused delete leaves the blob untouched.
-        if let Some(owner) = meta.owner.as_deref() {
-            if owner != requester {
-                return Ok(DeleteOutcome::NotOwner);
-            }
-        }
+        //
+        // Only an owner match authorises blocking the hash afterwards. An
+        // ownerless delete must leave the blocklist alone: otherwise any
+        // authenticated requester could block a hash server-wide by deleting
+        // it, with no moderation step.
+        let block = match meta.owner.as_deref() {
+            Some(owner) if owner == requester => true,
+            Some(_) => return Ok(DeleteOutcome::NotOwner),
+            None => false,
+        };
 
-        // BUD-09/12: commit the row delete and the blocklist entry together
-        // FIRST, so the hash is blocked before the file disappears. A crash
-        // then leaves an orphan file whose hash is already blocked, which
-        // `open` deletes; the inverse order could leave a row pointing at a
-        // missing blob that nothing repairs.
+        // BUD-09/12: commit the row delete and, for an owner-authorised delete,
+        // the blocklist entry together FIRST, so the hash is blocked before the
+        // file disappears. A crash then leaves an orphan file whose hash is
+        // already blocked, which `open` deletes; the inverse order could leave a
+        // row pointing at a missing blob that nothing repairs. An ownerless
+        // delete commits only the row delete, so its hash stays re-uploadable.
         let inner = Arc::clone(&self.inner);
         let owned = *hash;
-        let changed = blocking(move || inner.remove_and_block(&owned)).await?;
+        let changed = blocking(move || inner.remove_meta(&owned, block)).await?;
         if changed == 0 {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -1011,17 +1020,20 @@ fn insert_meta(conn: &Connection, meta: &BlobMeta) -> Result<usize, StoreError> 
     Ok(changed)
 }
 
-/// Deletes the blob's row and records its hash on the blocklist atomically.
-fn delete_meta_and_block(conn: &mut Connection, hash: &Sha256) -> Result<usize, StoreError> {
+/// Deletes the blob's row and, when `block` is set, records its hash on the
+/// blocklist atomically.
+fn delete_meta(conn: &mut Connection, hash: &Sha256, block: bool) -> Result<usize, StoreError> {
     let tx = conn.transaction()?;
     let changed = tx.execute("DELETE FROM blobs WHERE sha256 = ?1", [hash.to_hex()])?;
     if changed == 0 {
         return Ok(0);
     }
-    tx.execute(
-        "INSERT OR IGNORE INTO blocklist (sha256, blocked_at) VALUES (?1, ?2)",
-        rusqlite::params![hash.to_hex(), now_unix()],
-    )?;
+    if block {
+        tx.execute(
+            "INSERT OR IGNORE INTO blocklist (sha256, blocked_at) VALUES (?1, ?2)",
+            rusqlite::params![hash.to_hex(), now_unix()],
+        )?;
+    }
     tx.commit()?;
     Ok(changed)
 }
@@ -1850,6 +1862,14 @@ mod tests {
         assert_eq!(meta.owner, None);
         let reader = store.read(&hash, None).await.unwrap().unwrap();
         assert_eq!(read_all(reader).await, data);
+
+        // The recovered row is ownerless, so a requester may delete it and the
+        // delete must not block the hash.
+        assert_eq!(
+            store.delete(&hash, "anyone").await.unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert!(!store.is_blocked(&hash).await.unwrap());
     }
 
     #[tokio::test]
@@ -1862,16 +1882,23 @@ mod tests {
         };
         let hash = hash_of(ABC_HASH);
         let hex = hash.to_hex();
+        let owner = pubkey(0x11);
 
         {
             let store = FsBlobStore::open(config.clone()).await.unwrap();
             store
-                .put(body(b"abc"), PutOptions::default())
+                .put(
+                    body(b"abc"),
+                    PutOptions {
+                        owner: Some(owner.clone()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
-            // Deleting blocks the hash and removes the file.
+            // An owner-authorised delete blocks the hash and removes the file.
             assert_eq!(
-                store.delete(&hash, "anyone").await.unwrap(),
+                store.delete(&hash, &owner).await.unwrap(),
                 DeleteOutcome::Deleted
             );
             // Simulate a crash leftover by re-creating the file.
@@ -2287,6 +2314,40 @@ mod tests {
             store.delete(&hash, "whoever").await.unwrap(),
             DeleteOutcome::Deleted
         );
+        // No owner authorised this delete, so the hash must not be blocked.
+        assert!(!store.is_blocked(&hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ownerless_delete_does_not_block_so_the_bytes_can_be_reuploaded() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.delete(&hash, "whoever").await.unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert!(store.meta(&hash).await.unwrap().is_none());
+        assert!(
+            !store.is_blocked(&hash).await.unwrap(),
+            "an ownerless delete must not block the hash"
+        );
+
+        // The point of not blocking: the identical bytes stay uploadable, so a
+        // passer-by cannot permanently deny a hash server-wide.
+        let outcome = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PutOutcome::Created(_) | PutOutcome::Existed(_)),
+            "an ownerless delete must leave the hash re-uploadable, got {outcome:?}"
+        );
+        assert!(store.meta(&hash).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -2937,8 +2998,13 @@ mod tests {
         let (store, _dir) = open_store(1024).await;
         let store = Arc::new(store);
         let hash = hash_of(HELLO_WORLD_HASH);
+        let owner = pubkey(0x11);
+        let opts = |owner: &str| PutOptions {
+            owner: Some(owner.to_string()),
+            ..Default::default()
+        };
         store
-            .put(body(b"hello world"), PutOptions::default())
+            .put(body(b"hello world"), opts(&owner))
             .await
             .unwrap();
 
@@ -2949,15 +3015,14 @@ mod tests {
 
         let put = {
             let store = Arc::clone(&store);
-            tokio::spawn(
-                async move { store.put(body(b"hello world"), PutOptions::default()).await },
-            )
+            let owner = owner.clone();
+            tokio::spawn(async move { store.put(body(b"hello world"), opts(&owner)).await })
         };
         gate.reached.notified().await;
 
-        // The delete commits while the put is parked.
+        // The owner's delete commits while the put is parked.
         assert_eq!(
-            store.delete(&hash, "anyone").await.unwrap(),
+            store.delete(&hash, &owner).await.unwrap(),
             DeleteOutcome::Deleted
         );
         gate.resume.notify_one();

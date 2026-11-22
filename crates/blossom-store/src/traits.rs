@@ -165,9 +165,14 @@ pub trait BlobStore: Send + Sync + 'static {
     /// A blob whose `owner` is `None` may be deleted by any authenticated
     /// requester; a blob with an owner is only removable by that owner. The
     /// consequence is that blobs uploaded while the server ran with `--auth
-    /// none` are ownerless and stay deletable by anyone forever. A successful
-    /// delete records the hash on the blocklist so it cannot be re-uploaded
-    /// (BUD-09).
+    /// none` are ownerless and stay deletable by anyone forever.
+    ///
+    /// Only a delete authorised by an owner match records the hash on the
+    /// blocklist, so it cannot be re-uploaded (BUD-09). Deleting an ownerless
+    /// blob removes the row and the file but leaves the blocklist untouched,
+    /// so the same bytes stay uploadable: otherwise any authenticated
+    /// requester could block a hash server-wide with no moderation step.
+    /// Blocking a hash that is reported but not stored locally has no path yet.
     async fn delete(&self, hash: &Sha256, requester: &str) -> Result<DeleteOutcome, StoreError>;
 
     /// Lists a pubkey's blobs, newest first, excluding the cursor (BUD-12).
