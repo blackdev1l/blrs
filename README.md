@@ -12,17 +12,17 @@ Documents); this README cites them per feature.
 
 | Endpoint | BUD | Status |
 | --- | --- | --- |
-| `GET /<sha256>[.ext]` (+ `Range`) | [01](https://github.com/hzrd149/blossom/blob/master/buds/01.md) | planned |
-| `HEAD /<sha256>[.ext]` | [01](https://github.com/hzrd149/blossom/blob/master/buds/01.md) | planned |
-| `PUT /upload` | [02](https://github.com/hzrd149/blossom/blob/master/buds/02.md) | planned |
-| `HEAD /upload` | [06](https://github.com/hzrd149/blossom/blob/master/buds/06.md) | planned |
-| `PUT /mirror` | [04](https://github.com/hzrd149/blossom/blob/master/buds/04.md) | planned |
-| `PUT /media`, `HEAD /media` | [05](https://github.com/hzrd149/blossom/blob/master/buds/05.md) | planned |
-| `PUT /report` | [09](https://github.com/hzrd149/blossom/blob/master/buds/09.md) | planned |
-| `GET /list/<pubkey>` | [12](https://github.com/hzrd149/blossom/blob/master/buds/12.md) | planned |
-| `DELETE /<sha256>` | [12](https://github.com/hzrd149/blossom/blob/master/buds/12.md) | planned |
-| Nostr auth tokens (kind `24242`) | [11](https://github.com/hzrd149/blossom/blob/master/buds/11.md) | planned |
-| NIP-94 tags in descriptor | [08](https://github.com/hzrd149/blossom/blob/master/buds/08.md) | planned |
+| `GET /<sha256>[.ext]` (+ `Range`) | [01](https://github.com/hzrd149/blossom/blob/master/buds/01.md) | implemented |
+| `HEAD /<sha256>[.ext]` | [01](https://github.com/hzrd149/blossom/blob/master/buds/01.md) | implemented |
+| `PUT /upload` | [02](https://github.com/hzrd149/blossom/blob/master/buds/02.md) | implemented |
+| `HEAD /upload` | [06](https://github.com/hzrd149/blossom/blob/master/buds/06.md) | implemented |
+| `PUT /mirror` | [04](https://github.com/hzrd149/blossom/blob/master/buds/04.md) | implemented |
+| `PUT /media`, `HEAD /media` | [05](https://github.com/hzrd149/blossom/blob/master/buds/05.md) | implemented (no-op optimiser) |
+| `PUT /report` | [09](https://github.com/hzrd149/blossom/blob/master/buds/09.md) | implemented |
+| `GET /list/<pubkey>` | [12](https://github.com/hzrd149/blossom/blob/master/buds/12.md) | implemented |
+| `DELETE /<sha256>` | [12](https://github.com/hzrd149/blossom/blob/master/buds/12.md) | implemented |
+| Nostr auth tokens (kind `24242`) | [11](https://github.com/hzrd149/blossom/blob/master/buds/11.md) | implemented |
+| NIP-94 tags in descriptor | [08](https://github.com/hzrd149/blossom/blob/master/buds/08.md) | not implemented (optional) |
 | `402` payment headers | [07](https://github.com/hzrd149/blossom/blob/master/buds/07.md) | not implemented (optional) |
 
 BUD-03 (user server list) and BUD-10 (`blossom:` URIs) are client-side
