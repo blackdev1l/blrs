@@ -373,9 +373,10 @@ impl FsBlobStore {
             match blocking(move || inner.probe(&expected)).await? {
                 Probe::Blocked => return Err(StoreError::Blocked),
                 Probe::Existing(existing) => {
-                    // A row whose file is missing is not really stored: fall
-                    // through so the streaming path can heal it.
-                    if tokio::fs::try_exists(self.inner.blob_path(&expected)).await? {
+                    // A row whose file is missing or the wrong length is not
+                    // really stored: fall through so the streaming path can
+                    // heal it.
+                    if is_intact(&self.inner.blob_path(&expected), existing.size).await {
                         return Ok(PutOutcome::Existed(existing));
                     }
                 }
@@ -446,13 +447,13 @@ impl FsBlobStore {
 
         // Re-uploading identical bytes: discard the temp copy instead of
         // rewriting the same bytes to the SD card and losing the original
-        // mtime. A blocked hash is refused and a row whose file is gone is
-        // healed instead.
+        // mtime. A blocked hash is refused and a row whose file is missing or
+        // the wrong length is healed instead.
         let inner = Arc::clone(&self.inner);
         match blocking(move || inner.probe(&hash)).await? {
             Probe::Blocked => return Err(StoreError::Blocked),
             Probe::Existing(existing) => {
-                if tokio::fs::try_exists(&dest).await? {
+                if is_intact(&dest, existing.size).await {
                     return Ok(PutOutcome::Existed(existing));
                 }
                 tokio::fs::create_dir_all(&shard).await?;
@@ -802,6 +803,15 @@ async fn sync_dir(path: &Path) -> Result<(), StoreError> {
 #[cfg(not(unix))]
 async fn sync_dir(_path: &Path) -> Result<(), StoreError> {
     Ok(())
+}
+
+/// Whether the blob file at `path` is present and exactly `size` bytes.
+///
+/// A wrong-length file is treated as not stored so a re-upload heals it by
+/// renaming the freshly verified bytes over it. Bit rot that leaves the length
+/// intact is not detected — the hash is not re-read on this path.
+async fn is_intact(path: &Path, size: u64) -> bool {
+    matches!(tokio::fs::metadata(path).await, Ok(meta) if meta.len() == size)
 }
 
 /// Removes leftover `tmp/*.part` files from a previous run that crashed before
@@ -1956,6 +1966,110 @@ mod tests {
             .err()
             .expect("a missing file must be reported");
         assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    #[tokio::test]
+    async fn reupload_heals_a_missing_file() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        let path = store.inner.blob_path(&hash);
+        std::fs::remove_file(&path).unwrap();
+
+        let outcome = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 11);
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn reupload_heals_a_truncated_file_without_the_fast_path() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        let path = store.inner.blob_path(&hash);
+        truncate_blob(&path, 7);
+        assert!(matches!(
+            store.read(&hash, None).await,
+            Err(StoreError::Corrupt(_))
+        ));
+
+        // No X-SHA-256: the streaming path hashes the body and must notice the
+        // short file, renaming the verified bytes over it instead of answering
+        // `Existed` and leaving the blob unreadable.
+        let outcome = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 11);
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn reupload_heals_a_truncated_file_with_the_declared_hash() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        let path = store.inner.blob_path(&hash);
+        truncate_blob(&path, 7);
+
+        // A matching `X-SHA-256` takes the declared-hash fast path, which must
+        // fall through to the healing rename when the file is the wrong length.
+        let outcome = store
+            .put(
+                body(b"hello world"),
+                PutOptions {
+                    expected: Some(hash),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 11);
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn reupload_heals_a_grown_file() {
+        let (store, _dir) = open_store(1024).await;
+        let hash = hash_of(HELLO_WORLD_HASH);
+        store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        let path = store.inner.blob_path(&hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"TRAILING GARBAGE");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let outcome = store
+            .put(body(b"hello world"), PutOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PutOutcome::Existed(_)));
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 11);
+        let reader = store.read(&hash, None).await.unwrap().unwrap();
+        assert_eq!(read_all(reader).await, b"hello world");
     }
 
     #[tokio::test]

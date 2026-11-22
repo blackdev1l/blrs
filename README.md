@@ -57,7 +57,9 @@ any failed or cancelled upload, and `open` sweeps leftover `tmp/*.part` files.
 After the rename, the shard directory is `fsync`ed before the index row is
 inserted, and `open` re-indexes any orphan blob file (the filename is the hash,
 so the bytes are already valid). A re-upload of identical bytes is answered from
-the index without rewriting the SD card. Durability across a power cut is
+the index without rewriting the SD card, unless the stored file is missing or
+the wrong length, in which case the re-upload heals it. Durability across a
+power cut is
 best-effort: a blob written but not yet indexed is recovered on the next start,
 but the most recent write can still be lost. A `DELETE` removes the file, then
 the row, and records the hash on the blocklist in the same transaction, so a

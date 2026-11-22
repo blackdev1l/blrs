@@ -28,9 +28,9 @@ pub struct PutOptions {
     /// [`StoreError::HashMismatch`]. This is the `X-SHA-256` header.
     ///
     /// It is also the BUD-02 fast path: when a blob with this hash is already
-    /// stored, the store answers [`PutOutcome::Existed`] **without reading the
-    /// body**. The caller is responsible for draining or closing the request
-    /// body on that path.
+    /// stored and its file is intact, the store answers [`PutOutcome::Existed`]
+    /// **without reading the body**. The caller is responsible for draining or
+    /// closing the request body on that path.
     pub expected: Option<Sha256>,
     /// MIME type to record. When `None` the store sniffs the leading bytes,
     /// then falls back to `extension`, then `application/octet-stream`.
@@ -126,6 +126,13 @@ pub trait BlobStore: Send + Sync + 'static {
     /// [`StoreError::HashMismatch`] is returned. A cancelled or failed upload
     /// leaves no temporary file behind, and a hash on the blocklist is refused
     /// with [`StoreError::Blocked`] without storing the body.
+    ///
+    /// Re-uploading a hash that is already stored answers
+    /// [`PutOutcome::Existed`] without rewriting the file, provided the file is
+    /// present and exactly the row's `size` bytes. A file that is missing or the
+    /// wrong length is healed by renaming the freshly verified bytes over it.
+    /// Bit rot that leaves the length intact is not detected: the hash is not
+    /// re-read on this path.
     async fn put(
         &self,
         body: Box<dyn AsyncRead + Send + Unpin>,
