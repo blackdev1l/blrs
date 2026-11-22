@@ -765,9 +765,19 @@ async fn stream_body(
 }
 
 /// Opens a directory and `fsync`s it, making a completed rename durable.
+#[cfg(unix)]
 async fn sync_dir(path: &Path) -> Result<(), StoreError> {
     let dir = File::open(path).await?;
     dir.sync_all().await?;
+    Ok(())
+}
+
+/// No-op on Windows: `File::open` on a directory fails with `Access denied`,
+/// so there is no directory handle to flush. It is not needed either — NTFS
+/// journals metadata, so a completed rename is already durable without an
+/// explicit directory flush.
+#[cfg(not(unix))]
+async fn sync_dir(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -1044,7 +1054,6 @@ fn total_blob_bytes(conn: &Connection) -> Result<u64, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -1084,6 +1093,23 @@ mod tests {
 
     fn hash_of(hex: &str) -> Sha256 {
         Sha256::parse(hex).unwrap()
+    }
+
+    /// A stable per-file identity, so a test can prove a path still refers to
+    /// the same file. Unix uses the inode. Windows cannot use a real file
+    /// index — `MetadataExt::file_index()` is still unstable behind
+    /// `windows_by_handle` — so it falls back to a size + last-write-time
+    /// proxy. A rewrite inside the same timestamp tick could evade that proxy,
+    /// which is acceptable here: the two puts are separated by real file I/O.
+    #[cfg(unix)]
+    fn file_identity(metadata: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.ino(), None)
+    }
+
+    #[cfg(not(unix))]
+    fn file_identity(metadata: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
+        (metadata.len(), metadata.modified().ok())
     }
 
     /// A 64-character lowercase-hex pubkey, the only owner shape accepted.
@@ -1408,7 +1434,7 @@ mod tests {
             .unwrap();
 
         let path = store.inner.blob_path(&hash);
-        let inode_before = std::fs::metadata(&path).unwrap().ino();
+        let identity_before = file_identity(&std::fs::metadata(&path).unwrap());
 
         // No X-SHA-256: the body is streamed and hashed, but the identical
         // bytes must not be renamed over the existing file.
@@ -1419,8 +1445,8 @@ mod tests {
 
         assert!(matches!(outcome, PutOutcome::Existed(_)));
         assert_eq!(
-            std::fs::metadata(&path).unwrap().ino(),
-            inode_before,
+            file_identity(&std::fs::metadata(&path).unwrap()),
+            identity_before,
             "a re-upload must not replace the blob file"
         );
         assert_eq!(count_files(&dir.path().join("tmp")), 0);
