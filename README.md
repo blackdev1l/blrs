@@ -155,7 +155,7 @@ Configuration is available as CLI flags or `BLOSSOM_*` environment variables:
 | `--auth` | `BLOSSOM_AUTH` | `writes` | `none`, `writes`, or `all` |
 | `--enable-list` | `BLOSSOM_ENABLE_LIST` | `true` | Expose `GET /list/<pubkey>` |
 | `--enable-mirror` | `BLOSSOM_ENABLE_MIRROR` | `true` | Expose `PUT /mirror` |
-| `--enable-media` | `BLOSSOM_ENABLE_MEDIA` | `false` | Expose `PUT /media` |
+| `--enable-media` | `BLOSSOM_ENABLE_MEDIA` | `true` | Expose `PUT /media` |
 | `--mirror-allow-private` | `BLOSSOM_MIRROR_ALLOW_PRIVATE` | `false` | Allow mirroring from private addresses |
 | `--blocked-mime` | `BLOSSOM_BLOCKED_MIME` | _(empty)_ | Comma-separated MIME types to refuse |
 | `--max-total-size` | `BLOSSOM_MAX_TOTAL_SIZE` | `0` (unlimited) | Total budget for stored blobs |
@@ -184,7 +184,9 @@ successful write (`PUT /upload`, `PUT /media`, `PUT /mirror`, and
 `DELETE /<sha256>`) with the blob `sha256`, its byte `size`, the `owner` pubkey,
 and the `outcome` (`created`/`existed`/`deleted`), so an upload can be grepped by
 hash. Authorization failures log at `warn`, and storage errors at `warn` or
-`error`. The `Authorization` header and token contents are never logged.
+`error`. A request to a disabled endpoint (`/media`, `/mirror`, `/list`) logs a
+`warn` naming the flag that turns it on, so a 404 is never bare. The
+`Authorization` header and token contents are never logged.
 
 ```sh
 RUST_LOG=blossom_http=debug ./blrs --data-dir ./data

@@ -451,6 +451,10 @@ pub async fn put_media(
     body: Body,
 ) -> Result<Response, HttpError> {
     if !state.config.enable_media {
+        tracing::warn!(
+            endpoint = "PUT /media",
+            "media optimisation is disabled; enable it with --enable-media or BLOSSOM_ENABLE_MEDIA=true"
+        );
         return Err(HttpError::not_found("Media optimisation is disabled"));
     }
     store_upload(state, headers, body, Action::Media, true).await
@@ -532,6 +536,10 @@ pub async fn head_media(
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     if !state.config.enable_media {
+        tracing::warn!(
+            endpoint = "HEAD /media",
+            "media optimisation is disabled; enable it with --enable-media or BLOSSOM_ENABLE_MEDIA=true"
+        );
         return Err(HttpError::not_found("Media optimisation is disabled"));
     }
     preflight(state, headers, Action::Media, true).await
@@ -598,6 +606,10 @@ pub async fn put_mirror(
     body: Body,
 ) -> Result<Response, HttpError> {
     if !state.config.enable_mirror {
+        tracing::warn!(
+            endpoint = "PUT /mirror",
+            "mirroring is disabled; enable it with --enable-mirror or BLOSSOM_ENABLE_MIRROR=true"
+        );
         return Err(HttpError::not_found("Mirroring is disabled"));
     }
 
@@ -875,6 +887,10 @@ pub async fn get_list(
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     if !state.config.enable_list {
+        tracing::warn!(
+            endpoint = "GET /list",
+            "listing is disabled; enable it with --enable-list or BLOSSOM_ENABLE_LIST=true"
+        );
         return Err(HttpError::not_found("Listing is disabled"));
     }
 

@@ -170,7 +170,10 @@ struct Cli {
     #[arg(long, env = "BLOSSOM_ENABLE_MIRROR", default_value_t = true)]
     enable_mirror: bool,
 
-    #[arg(long, env = "BLOSSOM_ENABLE_MEDIA", default_value_t = false)]
+    // Enabled like `list` and `mirror`. The endpoint is implemented and a
+    // no-op optimiser is spec-legal (BUD-05 leaves the optimisation policy to
+    // the server), so shipping it off only turned it into a bare 404.
+    #[arg(long, env = "BLOSSOM_ENABLE_MEDIA", default_value_t = true)]
     enable_media: bool,
 
     /// Allow mirroring from loopback and private addresses. Off by default:
@@ -306,5 +309,15 @@ mod tests {
 
         let unlimited = from_args(&["blrs", "--max-total-size", "0"]).unwrap();
         assert_eq!(unlimited.max_total_bytes, None);
+    }
+
+    #[test]
+    fn optional_endpoints_are_enabled_by_default() {
+        // `/media` shipped off by default from the scaffold, which turned the
+        // implemented endpoint into a bare 404. It is enabled like the others.
+        let config = from_args(&["blrs"]).unwrap();
+        assert!(config.enable_media);
+        assert!(config.enable_mirror);
+        assert!(config.enable_list);
     }
 }
