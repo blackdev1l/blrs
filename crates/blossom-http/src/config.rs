@@ -88,8 +88,6 @@ pub struct Config {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("invalid configuration: {0}")]
-    Cli(#[from] clap::Error),
     #[error("public_url must be an absolute http(s) URL: {0}")]
     BadPublicUrl(String),
     #[error(
@@ -190,8 +188,13 @@ struct Cli {
 
 impl Config {
     /// Parses configuration from CLI flags and environment variables.
+    ///
+    /// `--help` and `--version` print to stdout and exit 0 rather than being
+    /// reported as a failure, which is what clap's own `exit` does. Usage errors
+    /// print to stderr and exit 2.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_cli(Cli::try_parse()?)
+        let cli = Cli::try_parse().unwrap_or_else(|err| err.exit());
+        Self::from_cli(cli)
     }
 
     fn from_cli(cli: Cli) -> Result<Self, ConfigError> {

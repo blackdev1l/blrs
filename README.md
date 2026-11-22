@@ -89,17 +89,17 @@ build and test runs in a container via `./dcargo.sh`:
 The release profile is tuned for the Pi: thin LTO, one codegen unit,
 `panic = "abort"`, and stripped symbols.
 
-### Cross-compiling for the Pi
+### Building the Raspberry Pi binary
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work rust:1-bookworm bash -c '
-  apt-get update && apt-get install -y gcc-aarch64-linux-gnu
-  rustup target add aarch64-unknown-linux-gnu
-  cargo build --release --target aarch64-unknown-linux-gnu
-'
+./scripts/build-pi.sh
 ```
 
-Or build on the Pi itself, which is simpler and avoids cross-linker setup.
+Produces `dist/blossom-aarch64`: an aarch64 Linux binary requiring **glibc >=
+2.31**, so it runs on Raspberry Pi OS bullseye and bookworm alike. It is built
+from a bullseye base **deliberately** — the binary links against the build
+image's glibc, so building on a newer base would raise the floor and silently
+produce an artifact that fails to start on older hosts.
 
 ## Running
 
@@ -121,6 +121,21 @@ Configuration is available as CLI flags or `BLOSSOM_*` environment variables:
 | `--enable-media` | `BLOSSOM_ENABLE_MEDIA` | `false` | Expose `PUT /media` |
 | `--mirror-allow-private` | `BLOSSOM_MIRROR_ALLOW_PRIVATE` | `false` | Allow mirroring from private addresses |
 | `--blocked-mime` | `BLOSSOM_BLOCKED_MIME` | _(empty)_ | Comma-separated MIME types to refuse |
+| `--max-total-size` | `BLOSSOM_MAX_TOTAL_SIZE` | `0` (unlimited) | Total budget for stored blobs |
+
+`--max-total-size` accepts `k`/`m`/`g`/`t`, optionally followed by `b` or `ib`,
+case-insensitively. **Every suffix is binary**, because the value is compared
+against real card capacity: `4G` = `4GiB` = 4294967296 bytes. A bare number is
+bytes, so an exact value is never ambiguous. `0` or absent means unlimited.
+
+It is a whole-server budget, enforced at three points: before reading a body
+(from the declared `Content-Length`), while streaming — so a client that lies
+about its length is still stopped — and authoritatively inside the insert
+transaction, so concurrent uploads cannot between them exceed it. Exhaustion is
+`429` with an `X-Reason`. Re-uploading a blob that already exists consumes no new
+space and is never refused, even at 100%.
+
+`--max-blob-size` and `--max-total-size` are independent; both apply.
 
 ## Security notes
 
