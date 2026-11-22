@@ -87,18 +87,56 @@ fn authorize(
     action: Action,
     blob: Option<&Sha256>,
 ) -> Result<Option<AuthorizedUser>, HttpError> {
-    match bearer_token(headers)? {
+    let token = match bearer_token(headers) {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(action = action.verb(), "authorization header is malformed");
+            return Err(err);
+        }
+    };
+    match token {
         Some(token) => {
             let ctx = VerifyContext::new(action, &state.config.host, blob, state.clock.now());
-            let user = token
-                .verify(ctx)
-                .map_err(|err| HttpError::unauthorized(&err))?;
-            Ok(Some(user))
+            match token.verify(ctx) {
+                Ok(user) => Ok(Some(user)),
+                Err(err) => {
+                    tracing::warn!(
+                        action = action.verb(),
+                        reason = err.reason(),
+                        "authorization token rejected"
+                    );
+                    Err(HttpError::unauthorized(&err))
+                }
+            }
         }
         None if state.config.auth.requires(action) => {
+            tracing::warn!(
+                action = action.verb(),
+                "authorization is required but the request carried no token"
+            );
             Err(HttpError::unauthorized(&AuthError::Missing))
         }
         None => Ok(None),
+    }
+}
+
+/// Logs a failed store write at the level its cause deserves.
+///
+/// A backend failure (an `io` or index error, a corrupt file) is an `error`;
+/// every other store error is the request's own fault and is only a `warn`, so
+/// a client sending a mismatched hash does not read as a storage outage.
+fn log_store_failure(action: &str, err: &StoreError, message: &str) {
+    let internal = matches!(
+        err,
+        StoreError::Io(_)
+            | StoreError::Index(_)
+            | StoreError::IndexTask(_)
+            | StoreError::Corrupt(_)
+    );
+    if internal {
+        tracing::error!(action, error = %err, "{message}");
+    } else {
+        tracing::warn!(action, error = %err, "{message}");
     }
 }
 
@@ -118,6 +156,10 @@ fn authorize_declared(
     match declared {
         Some(hash) => authorize(state, headers, action, Some(hash)),
         None if state.config.auth.requires(action) => {
+            tracing::warn!(
+                action = action.verb(),
+                "authorization is required but the request did not declare X-SHA-256"
+            );
             Err(HttpError::unauthorized(&AuthError::MissingXTag))
         }
         None => Ok(None),
@@ -446,14 +488,33 @@ async fn store_upload(
     let declared = declared_hash(&headers)?;
     let user = authorize_declared(&state, &headers, action, declared.as_ref())?;
 
+    let owner = user.map(|user| user.pubkey().to_string());
     let opts = PutOptions {
         expected: declared,
         mime,
-        owner: user.map(|user| user.pubkey().to_string()),
+        owner: owner.clone(),
         declared_size: Some(length),
         extension: None,
     };
-    let outcome = state.store.put(body_reader(body), opts).await?;
+    let outcome = match state.store.put(body_reader(body), opts).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            log_store_failure(action.verb(), &err, "upload failed");
+            return Err(err.into());
+        }
+    };
+    let (outcome_label, meta) = match &outcome {
+        PutOutcome::Created(meta) => ("created", meta),
+        PutOutcome::Existed(meta) => ("existed", meta),
+    };
+    tracing::info!(
+        action = action.verb(),
+        sha256 = %meta.sha256,
+        size = meta.size,
+        owner = owner.as_deref().unwrap_or(""),
+        outcome = outcome_label,
+        "blob stored"
+    );
     Ok(descriptor_response(&state, outcome))
 }
 
@@ -598,12 +659,30 @@ pub async fn put_mirror(
     let opts = PutOptions {
         expected,
         mime,
-        owner,
+        owner: owner.clone(),
         declared_size: content_length,
         extension: url_extension(&final_url),
     };
     let stream = boxed_reader(response.bytes_stream());
-    let outcome = state.store.put(stream, opts).await?;
+    let outcome = match state.store.put(stream, opts).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            log_store_failure(Action::Upload.verb(), &err, "mirror failed");
+            return Err(err.into());
+        }
+    };
+    let (outcome_label, meta) = match &outcome {
+        PutOutcome::Created(meta) => ("created", meta),
+        PutOutcome::Existed(meta) => ("existed", meta),
+    };
+    tracing::info!(
+        url = %final_url,
+        sha256 = %meta.sha256,
+        size = meta.size,
+        owner = owner.as_deref().unwrap_or(""),
+        outcome = outcome_label,
+        "blob mirrored"
+    );
     Ok(descriptor_response(&state, outcome))
 }
 
@@ -633,9 +712,14 @@ fn verify_mirror_token(
         Some(hash),
         state.clock.now(),
     );
-    let user = token
-        .verify(ctx)
-        .map_err(|err| HttpError::unauthorized(&err))?;
+    let user = token.verify(ctx).map_err(|err| {
+        tracing::warn!(
+            action = Action::Upload.verb(),
+            reason = err.reason(),
+            "mirror authorization token rejected"
+        );
+        HttpError::unauthorized(&err)
+    })?;
     Ok(user.pubkey().to_string())
 }
 
@@ -842,9 +926,36 @@ pub async fn delete_blob(
     let requester = user
         .map(|user| user.pubkey().to_string())
         .unwrap_or_default();
-    match state.store.delete(&hash, &requester).await? {
-        DeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT.into_response()),
-        DeleteOutcome::NotFound => Err(HttpError::not_found("Blob not found")),
-        DeleteOutcome::NotOwner => Err(HttpError::forbidden("Requester does not own this blob")),
+    match state.store.delete(&hash, &requester).await {
+        Ok(DeleteOutcome::Deleted) => {
+            tracing::info!(
+                sha256 = %hash,
+                requester = %requester,
+                outcome = "deleted",
+                "blob deleted"
+            );
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Ok(DeleteOutcome::NotFound) => {
+            tracing::info!(
+                sha256 = %hash,
+                requester = %requester,
+                outcome = "not_found",
+                "delete found no blob"
+            );
+            Err(HttpError::not_found("Blob not found"))
+        }
+        Ok(DeleteOutcome::NotOwner) => {
+            tracing::warn!(
+                sha256 = %hash,
+                requester = %requester,
+                "delete refused: requester does not own the blob"
+            );
+            Err(HttpError::forbidden("Requester does not own this blob"))
+        }
+        Err(err) => {
+            log_store_failure(Action::Delete.verb(), &err, "delete failed");
+            Err(err.into())
+        }
     }
 }
