@@ -290,6 +290,17 @@ impl FsBlobStore {
     ///
     /// Creates the directory tree, applies the SQLite schema, sweeps leftover
     /// `tmp/*.part` files, and reconciles blob files that have no index row.
+    ///
+    /// # Once per process
+    ///
+    /// Call this once per `data_dir`. The sweep and reconcile passes assume
+    /// this store is the only writer: a second `open` on a live `data_dir` can
+    /// delete a live upload's temp file (the pid guard keeps this process's
+    /// in-flight uploads, but a temp file another process is still streaming is
+    /// indistinguishable from a crash leftover) and can insert an unsupervised
+    /// `owner = None` row for a blob whose `put` has renamed the file but not
+    /// yet committed its row, so that `put` reports `Existed` with the
+    /// reconciled row and loses the real owner and timestamp.
     pub async fn open(config: StoreConfig) -> Result<Self, StoreError> {
         let blobs_dir = config.data_dir.join("blobs");
         let tmp_dir = config.data_dir.join("tmp");
@@ -816,13 +827,29 @@ async fn is_intact(path: &Path, size: u64) -> bool {
 
 /// Removes leftover `tmp/*.part` files from a previous run that crashed before
 /// its upload finished.
+///
+/// A temp file embeds its owning pid before the first `-` (see
+/// [`Inner::new_tmp_path`]). Files whose pid is the current process are kept:
+/// they may belong to an upload still in flight, and a second
+/// [`FsBlobStore::open`] on a live `data_dir` must not delete them. A pid that
+/// is foreign or unparseable is a crash leftover and is removed.
 fn sweep_tmp(tmp_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(tmp_dir) else {
         return;
     };
+    let own_pid = std::process::id();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some(TMP_SUFFIX) {
+        if path.extension().and_then(|ext| ext.to_str()) != Some(TMP_SUFFIX) {
+            continue;
+        }
+        let owned_by_this_process = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+            == Some(own_pid);
+        if !owned_by_this_process {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -1148,6 +1175,11 @@ mod tests {
     /// A 64-character lowercase-hex pubkey, the only owner shape accepted.
     fn pubkey(byte: u8) -> String {
         format!("{byte:02x}").repeat(32)
+    }
+
+    /// A pid that is not this process's, used to model a crash leftover.
+    fn foreign_pid() -> u32 {
+        std::process::id().wrapping_add(1)
     }
 
     /// Number of files anywhere under `dir`, used to prove nothing was stored.
@@ -1785,6 +1817,71 @@ mod tests {
         assert_eq!(store.reconciled_count(), 0);
         assert!(store.meta(&hash).await.unwrap().is_none());
         assert!(!dir.path().join("blobs").join(&hex[..2]).join(&hex).exists());
+    }
+
+    #[test]
+    fn sweep_tmp_keeps_this_process_files_and_removes_foreign_or_unparseable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+        let own = tmp.join(format!("{}-0-1.part", std::process::id()));
+        let foreign = tmp.join(format!("{}-0-2.part", foreign_pid()));
+        let unparseable = tmp.join("not-a-pid-3.part");
+        let ignored = tmp.join("not-a-temp-file");
+        for path in [&own, &foreign, &unparseable, &ignored] {
+            std::fs::write(path, b"body").unwrap();
+        }
+
+        sweep_tmp(tmp);
+
+        assert!(own.exists(), "a temp file owned by this process must survive");
+        assert!(!foreign.exists(), "a foreign temp file must be swept");
+        assert!(
+            !unparseable.exists(),
+            "a temp file with an unparseable pid must be swept"
+        );
+        assert!(ignored.exists(), "non-.part files are never touched");
+    }
+
+    #[tokio::test]
+    async fn open_keeps_this_process_tmp_files_but_removes_foreign_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+            max_total_bytes: None,
+        };
+        // Model a second store opened on a live data dir while this process has
+        // an upload in flight: its temp file is named after the owning pid.
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let live = tmp.join(format!("{}-0-1.part", std::process::id()));
+        std::fs::write(&live, b"in-flight").unwrap();
+        let stale = tmp.join(format!("{}-0-2.part", foreign_pid()));
+        std::fs::write(&stale, b"leftover").unwrap();
+
+        FsBlobStore::open(config).await.unwrap();
+
+        assert!(live.exists(), "a live upload's temp file must survive open");
+        assert_eq!(std::fs::read(&live).unwrap(), b"in-flight");
+        assert!(!stale.exists(), "a crash leftover must be swept");
+    }
+
+    #[tokio::test]
+    async fn open_removes_a_stale_foreign_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+            max_total_bytes: None,
+        };
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let stale = tmp.join(format!("{}-0-1.part", foreign_pid()));
+        std::fs::write(&stale, b"leftover").unwrap();
+
+        FsBlobStore::open(config).await.unwrap();
+
+        assert!(!stale.exists(), "open must still clean up crash leftovers");
     }
 
     #[tokio::test]

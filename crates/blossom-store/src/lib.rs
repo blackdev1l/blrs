@@ -15,6 +15,11 @@
 //! blob cannot be rewritten (BUD-09) and a crash leaves an orphan file the next
 //! `open` removes rather than a row pointing at nothing.
 //!
+//! `open` runs those recovery passes once per process: they assume the store is
+//! the only writer to `data_dir`, so a second `open` on a live store can delete
+//! an in-flight upload's temp file or re-index a blob whose row has not
+//! committed yet.
+//!
 //! Durability across a power cut is best-effort, not absolute: an upload that
 //! had not reached the row insert is recovered by the next `open`, but the most
 //! recent write can still be lost.
