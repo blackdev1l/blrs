@@ -1,0 +1,23 @@
+# Cross-compilation image for Raspberry Pi (aarch64 Linux).
+#
+# Debian **bullseye** rather than bookworm on purpose: the binary is linked
+# against whatever glibc this image ships, and building on the older base gives
+# the lower glibc floor, so one artifact runs on Raspberry Pi OS bullseye AND
+# bookworm rather than only the newer one.
+#
+# Build:  docker build -t blrs-pi:1 -f docker/Dockerfile.pi docker/
+FROM rust:1-bullseye
+
+RUN rustup target add aarch64-unknown-linux-gnu \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      gcc-aarch64-linux-gnu \
+      libc6-dev-arm64-cross \
+      file \
+ && rm -rf /var/lib/apt/lists/*
+
+# Point cargo's linker for the Pi target at the cross toolchain. rusqlite's
+# bundled SQLite and secp256k1-sys both compile C, so CC must be set too.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar

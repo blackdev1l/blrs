@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs live as local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues on `blackdev1l/blrs`, driven by the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
