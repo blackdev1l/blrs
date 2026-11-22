@@ -22,6 +22,11 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     container: rust:1-bullseye
+    # A container job's default shell is `sh`, not `bash`, and these steps use
+    # bash features (`set -o pipefail`, `read -a`) that dash rejects with exit 2.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -43,6 +48,10 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     container: rust:1-bullseye
+    # Same `sh`-vs-`bash` trap as `verify`: packaging is a bash script.
+    defaults:
+      run:
+        shell: bash
     strategy:
       # One architecture that fails to build must not withdraw the artifacts of
       # the others, since a partial release is still better than none.
