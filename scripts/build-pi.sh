@@ -11,7 +11,10 @@
 # Usage:  ./scripts/build-pi.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -W)"
+# `pwd -W` is an MSYS/Git-Bash extension that yields a Windows path for the
+# Docker volume mount; GNU `pwd` rejects the option, so fall back to the
+# physical path on a real Linux host.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && { pwd -W 2>/dev/null || pwd -P; })"
 IMAGE="${BLOSSOM_PI_IMAGE:-blrs-pi:1}"
 
 export MSYS_NO_PATHCONV=1

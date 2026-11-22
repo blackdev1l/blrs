@@ -11,7 +11,10 @@
 #   ./dcargo.sh build --release
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"
+# `pwd -W` is an MSYS/Git-Bash extension that yields a Windows path for the
+# Docker volume mount below; GNU `pwd` rejects the option, so fall back to the
+# physical path on a real Linux host.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd -P; })"
 IMAGE="${BLOSSOM_RUST_IMAGE:-blrs-rust:1}"
 
 # The upstream `rust` image ships without clippy, which this project gates on,
