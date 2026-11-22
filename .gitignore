@@ -5,5 +5,5 @@
 *.db-wal
 *.db-shm
 .env
-.pi/subagents/
+.pi/
 /dist
