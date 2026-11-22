@@ -50,6 +50,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let store = FsBlobStore::open(StoreConfig {
         data_dir: config.data_dir.clone(),
         max_blob_size: config.max_blob_size,
+        max_total_bytes: config.max_total_bytes,
     })
     .await?;
 

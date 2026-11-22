@@ -75,6 +75,8 @@ pub struct Config {
     /// Bare lowercase domain, matched against BUD-11 `server` tags.
     pub host: String,
     pub max_blob_size: u64,
+    /// Total committed blob bytes allowed, or `None` for unlimited.
+    pub max_total_bytes: Option<u64>,
     pub auth: AuthPolicy,
     pub enable_list: bool,
     pub enable_mirror: bool,
@@ -90,6 +92,46 @@ pub enum ConfigError {
     Cli(#[from] clap::Error),
     #[error("public_url must be an absolute http(s) URL: {0}")]
     BadPublicUrl(String),
+    #[error(
+        "invalid size {0:?}: expected a number of bytes with an optional k/m/g/t suffix \
+         (optionally b or ib, all binary), for example 4G"
+    )]
+    BadSize(String),
+}
+
+/// Parses a disk-size flag into bytes.
+///
+/// Suffixes `k`, `m`, `g` and `t` are binary (1024-based) and may be followed by
+/// `b` or `ib`; a bare number is bytes. Matching is case-insensitive. `0` and an
+/// empty value mean no limit (`None`). Anything else — a sign, an unknown
+/// suffix, or an overflowing value — is [`ConfigError::BadSize`].
+pub fn parse_max_total_size(raw: &str) -> Result<Option<u64>, ConfigError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let digits_end = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    if digits_end == 0 {
+        return Err(ConfigError::BadSize(raw.to_string()));
+    }
+    let (digits, suffix) = value.split_at(digits_end);
+    let number: u64 = digits
+        .parse()
+        .map_err(|_| ConfigError::BadSize(raw.to_string()))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1u64,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        _ => return Err(ConfigError::BadSize(raw.to_string())),
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::BadSize(raw.to_string()))?;
+    Ok((bytes != 0).then_some(bytes))
 }
 
 #[derive(Parser, Debug)]
@@ -111,6 +153,15 @@ struct Cli {
     /// Largest single blob accepted, in bytes.
     #[arg(long, env = "BLOSSOM_MAX_BLOB_SIZE", default_value_t = 100 * 1024 * 1024)]
     max_blob_size: u64,
+
+    /// Total disk budget for stored blobs, for example `4G` (all suffixes are
+    /// binary). `0` or absent means unlimited.
+    #[arg(
+        long = "max-total-size",
+        env = "BLOSSOM_MAX_TOTAL_SIZE",
+        default_value = "0"
+    )]
+    max_total_size: String,
 
     #[arg(long, env = "BLOSSOM_AUTH", value_enum, default_value_t = AuthMode::Writes)]
     auth: AuthMode,
@@ -162,6 +213,7 @@ impl Config {
             .host_str()
             .expect("host was checked above")
             .to_ascii_lowercase();
+        let max_total_bytes = parse_max_total_size(&cli.max_total_size)?;
 
         Ok(Self {
             bind: cli.bind,
@@ -169,6 +221,7 @@ impl Config {
             public_base,
             host,
             max_blob_size: cli.max_blob_size,
+            max_total_bytes,
             auth: AuthPolicy::for_mode(cli.auth),
             enable_list: cli.enable_list,
             enable_mirror: cli.enable_mirror,
@@ -212,5 +265,43 @@ mod tests {
             from_args(&["blossom", "--public-url", "cdn.example.com:3000"]),
             Err(ConfigError::BadPublicUrl(_))
         ));
+    }
+
+    #[test]
+    fn max_total_size_parses_every_binary_suffix_and_a_bare_number() {
+        // Every suffix is 1024-based: 4G == 4GiB == 4 * 1024^3.
+        for spelling in ["4G", "4g", "4gb", "4gB", "4GiB", "4gib"] {
+            assert_eq!(
+                parse_max_total_size(spelling).unwrap(),
+                Some(4 * 1024 * 1024 * 1024),
+                "{spelling}"
+            );
+        }
+        assert_eq!(parse_max_total_size("500M").unwrap(), Some(500 << 20));
+        assert_eq!(parse_max_total_size("2kib").unwrap(), Some(2 << 10));
+        assert_eq!(parse_max_total_size("1T").unwrap(), Some(1 << 40));
+        assert_eq!(parse_max_total_size("1024").unwrap(), Some(1024));
+        assert_eq!(parse_max_total_size("1024b").unwrap(), Some(1024));
+        assert_eq!(parse_max_total_size("0").unwrap(), None);
+        assert_eq!(parse_max_total_size("").unwrap(), None);
+    }
+
+    #[test]
+    fn max_total_size_rejects_bad_values() {
+        for bad in ["4X", "-1", "4GG", "G", "4.5G", "4 G"] {
+            assert!(
+                matches!(parse_max_total_size(bad), Err(ConfigError::BadSize(_))),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn max_total_size_flag_feeds_the_config() {
+        let config = from_args(&["blossom", "--max-total-size", "4GiB"]).unwrap();
+        assert_eq!(config.max_total_bytes, Some(4 * 1024 * 1024 * 1024));
+
+        let unlimited = from_args(&["blossom", "--max-total-size", "0"]).unwrap();
+        assert_eq!(unlimited.max_total_bytes, None);
     }
 }

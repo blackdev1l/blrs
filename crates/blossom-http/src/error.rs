@@ -50,6 +50,11 @@ impl HttpError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, reason)
     }
 
+    /// BUD-02 lists `429` for "a rate limit or quota".
+    pub fn too_many_requests(reason: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, reason)
+    }
+
     pub fn unsupported_media_type(reason: impl Into<String>) -> Self {
         Self::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, reason)
     }
@@ -100,6 +105,7 @@ impl From<StoreError> for HttpError {
             StoreError::TooLarge => Self::payload_too_large(reason),
             StoreError::HashMismatch => Self::conflict(reason),
             StoreError::Blocked => Self::forbidden(reason),
+            StoreError::QuotaExceeded => Self::too_many_requests(reason),
             StoreError::BodyRead(_) => Self::bad_request(reason),
             StoreError::IndexTask(_) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, reason),
             StoreError::InvalidOwner | StoreError::InvalidRange => Self::bad_request(reason),

@@ -10,9 +10,10 @@
 //! non-successful exit (including a cancelled request) and `open` sweeps
 //! `tmp/*.part`; after the rename the shard directory is `fsync`ed before the
 //! index row is inserted; and `open` re-indexes any orphan blob file, skipping
-//! blocklisted hashes. A `DELETE` removes the file first and records the hash
-//! on the blocklist in the same transaction as its row delete, so a removed
-//! blob cannot be rewritten (BUD-09).
+//! blocklisted hashes. A `DELETE` records the hash on the blocklist in the same
+//! transaction as its row delete and unlinks the file afterwards, so a removed
+//! blob cannot be rewritten (BUD-09) and a crash leaves an orphan file the next
+//! `open` removes rather than a row pointing at nothing.
 //!
 //! Durability across a power cut is best-effort, not absolute: an upload that
 //! had not reached the row insert is recovered by the next `open`, but the most
