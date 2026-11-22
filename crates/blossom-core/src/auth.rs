@@ -7,6 +7,14 @@ use sha2::{Digest, Sha256 as Sha2};
 use crate::error::AuthError;
 use crate::sha256::Sha256;
 
+/// How far `created_at` may sit in the future before a token is rejected.
+///
+/// BUD-11 requires `created_at` to be in the past, but client and server clocks
+/// are never exactly equal: an NTP-synced pair can still differ by a second,
+/// and a Raspberry Pi has no RTC until NTP settles after boot. Rejecting a
+/// token a few seconds ahead would fail legitimate uploads, so allow a minute.
+const CLOCK_SKEW_TOLERANCE: i64 = 60;
+
 /// The action an authorization token authorizes (BUD-11 `t` tag).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -184,7 +192,7 @@ impl AuthToken {
     /// otherwise sail through the checklist checks.
     ///
     /// 1. kind is 24242
-    /// 2. `created_at` is in the past
+    /// 2. `created_at` is in the past, within a one-minute clock-skew allowance
     /// 3. `expiration` tag is present and in the future
     /// 4. a `t` tag matches the endpoint's action
     /// 5. if any `server` tag is present, this host is among its values
@@ -197,8 +205,11 @@ impl AuthToken {
         if event.kind != 24242 {
             return Err(AuthError::WrongKind);
         }
-        if event.created_at > ctx.now {
-            return Err(AuthError::CreatedInFuture);
+        if event.created_at > ctx.now + CLOCK_SKEW_TOLERANCE {
+            return Err(AuthError::CreatedInFuture {
+                created_at: event.created_at,
+                now: ctx.now,
+            });
         }
         let expiration = event
             .tag_values("expiration")
@@ -569,12 +580,26 @@ mod tests {
 
     #[test]
     fn verify_rejects_created_in_future() {
+        let event = signed_event(
+            24242,
+            NOW + CLOCK_SKEW_TOLERANCE + 1,
+            upload_tags(),
+            "Upload Blob",
+        );
+        let blob = Sha256::parse(X_HEX).unwrap();
+        assert!(matches!(
+            token(event).verify(upload_ctx(&blob)),
+            Err(AuthError::CreatedInFuture { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_allows_created_at_within_the_clock_skew_allowance() {
+        // A client a second ahead of the server must not lose its upload to a
+        // clock that is merely a little fast.
         let event = signed_event(24242, NOW + 1, upload_tags(), "Upload Blob");
         let blob = Sha256::parse(X_HEX).unwrap();
-        assert_eq!(
-            token(event).verify(upload_ctx(&blob)),
-            Err(AuthError::CreatedInFuture)
-        );
+        assert!(token(event).verify(upload_ctx(&blob)).is_ok());
     }
 
     #[test]

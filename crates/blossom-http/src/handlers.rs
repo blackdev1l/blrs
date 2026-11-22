@@ -103,6 +103,7 @@ fn authorize(
                     tracing::warn!(
                         action = action.verb(),
                         reason = err.reason(),
+                        detail = %err,
                         "authorization token rejected"
                     );
                     Err(HttpError::unauthorized(&err))
@@ -728,6 +729,7 @@ fn verify_mirror_token(
         tracing::warn!(
             action = Action::Upload.verb(),
             reason = err.reason(),
+            detail = %err,
             "mirror authorization token rejected"
         );
         HttpError::unauthorized(&err)

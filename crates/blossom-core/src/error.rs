@@ -28,8 +28,11 @@ pub enum AuthError {
     BadEventId,
     #[error("event signature is invalid")]
     BadSignature,
-    #[error("created_at is in the future")]
-    CreatedInFuture,
+    #[error(
+        "created_at {created_at} is {}s ahead of server time {now}",
+        .created_at - .now
+    )]
+    CreatedInFuture { created_at: i64, now: i64 },
     #[error("missing expiration tag")]
     MissingExpiration,
     #[error("authorization token has expired")]
@@ -55,7 +58,7 @@ impl AuthError {
             AuthError::WrongKind => "Authorization token kind must be 24242",
             AuthError::BadEventId => "Event id does not match the event contents",
             AuthError::BadSignature => "Event signature is invalid",
-            AuthError::CreatedInFuture => "created_at is in the future",
+            AuthError::CreatedInFuture { .. } => "created_at is in the future",
             AuthError::MissingExpiration => "Missing expiration tag",
             AuthError::Expired => "Authorization token has expired",
             AuthError::WrongVerb => "Token `t` tag does not authorize this action",
