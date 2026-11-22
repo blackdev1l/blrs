@@ -108,7 +108,10 @@ impl From<StoreError> for HttpError {
             StoreError::QuotaExceeded => Self::too_many_requests(reason),
             StoreError::BodyRead(_) => Self::bad_request(reason),
             StoreError::IndexTask(_) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, reason),
-            StoreError::InvalidOwner | StoreError::InvalidRange => Self::bad_request(reason),
+            StoreError::InvalidOwner
+            | StoreError::InvalidRange
+            | StoreError::EmptyReport
+            | StoreError::InvalidReporter => Self::bad_request(reason),
             StoreError::Index(_) | StoreError::Corrupt(_) | StoreError::Io(_) => {
                 Self::unavailable(reason)
             }

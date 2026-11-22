@@ -46,6 +46,12 @@ pub enum StoreError {
     /// A requested byte range does not lie inside the stored blob.
     #[error("requested range is outside the blob")]
     InvalidRange,
+    /// A report arrived with no hashes to attach it to (BUD-09).
+    #[error("report must reference at least one hash")]
+    EmptyReport,
+    /// A report's reporter is not a 64-character lowercase hex pubkey (BUD-09).
+    #[error("reporter must be 64-character lowercase hex")]
+    InvalidReporter,
 }
 
 impl StoreError {
@@ -58,6 +64,8 @@ impl StoreError {
             StoreError::QuotaExceeded => "Total disk quota is exhausted",
             StoreError::InvalidOwner => "Owner must be 64-character lowercase hex",
             StoreError::InvalidRange => "Requested range is outside the blob",
+            StoreError::EmptyReport => "Report must reference at least one hash",
+            StoreError::InvalidReporter => "Reporter must be 64-character lowercase hex",
             StoreError::BodyRead(_) => "Could not read the request body",
             StoreError::Index(_)
             | StoreError::IndexTask(_)

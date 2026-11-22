@@ -11,8 +11,9 @@
 /// - `blobs` is keyed by the blob hash, so a re-upload is a lookup, not a write.
 /// - `reports` keeps NIP-56 reports for operator review (BUD-09). Reporting is
 ///   kept separate from removal: a report never blocks, and the unique key on
-///   `(sha256, reporter, created_at)` makes a repeat report a no-op instead of
-///   growing the table without bound.
+///   `(sha256, reporter)` makes a repeat report a no-op instead of growing the
+///   table without bound. `created_at` is client-supplied, so it is deliberately
+///   not part of the key: a reporter has exactly one report per blob.
 /// - `blocklist` records hashes moderation has removed, so `put` can refuse to
 ///   rewrite them (BUD-09).
 pub const SCHEMA: &str = r#"
@@ -37,7 +38,7 @@ CREATE TABLE IF NOT EXISTS reports (
     kind       TEXT NOT NULL,
     content    TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE (sha256, reporter, created_at)
+    UNIQUE (sha256, reporter)
 );
 CREATE INDEX IF NOT EXISTS reports_sha256 ON reports (sha256);
 

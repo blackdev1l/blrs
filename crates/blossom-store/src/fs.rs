@@ -63,9 +63,22 @@ const HASH_BUCKETS: usize = 256;
 /// operator-facing; an unbounded list is an easy way to grow the table.
 const MAX_REPORT_HASHES: usize = 32;
 
+/// Largest report `content` accepted, in bytes. A NIP-56 report is a short
+/// operator note, not a payload: 4 KiB is generous for real prose and bounds
+/// the per-row storage a reporter can add. The `/report` request body is
+/// already capped upstream; this caps what reaches the table.
+const MAX_REPORT_CONTENT: usize = 4096;
+
 /// Largest `ListQuery::limit` the store honours, regardless of what a caller
 /// asks for.
 const MAX_LIST_LIMIT: u32 = 100;
+
+/// Current schema version recorded in `PRAGMA user_version`.
+///
+/// v1 changed the `reports` key from `(sha256, reporter, created_at)` to
+/// `(sha256, reporter)`, so `created_at` (client-supplied) can no longer buy a
+/// reporter extra rows.
+const SCHEMA_VERSION: i64 = 1;
 
 /// A selected row from the `blobs` table, before validation.
 type RawMeta = (String, i64, String, i64, Option<String>);
@@ -309,8 +322,9 @@ impl FsBlobStore {
 
         let db_path = config.data_dir.join("index.db");
         let inner = blocking(move || -> Result<Inner, StoreError> {
-            let conn = Connection::open(&db_path)?;
+            let mut conn = Connection::open(&db_path)?;
             conn.execute_batch(SCHEMA)?;
+            migrate(&mut conn)?;
             sweep_tmp(&tmp_dir);
             let reconciled = reconcile(&conn, &blobs_dir);
             // Recompute the committed total from the index so the counter
@@ -673,8 +687,18 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn save_report(&self, report: ReportRecord) -> Result<(), StoreError> {
-        if report.hashes.len() > MAX_REPORT_HASHES {
+        // The store owns report validation, as it does for a put's owner:
+        // reject a malformed report before it can reach the table.
+        if report.hashes.len() > MAX_REPORT_HASHES || report.content.len() > MAX_REPORT_CONTENT {
             return Err(StoreError::TooLarge);
+        }
+        if report.hashes.is_empty() {
+            return Err(StoreError::EmptyReport);
+        }
+        // A reporter is a BUD-09 pubkey, the same 64-character lowercase hex
+        // shape `put` requires of an owner.
+        if Sha256::parse(&report.reporter).is_err() {
+            return Err(StoreError::InvalidReporter);
         }
         let inner = Arc::clone(&self.inner);
         blocking(move || inner.save(&report)).await
@@ -1068,6 +1092,49 @@ fn list_meta(conn: &Connection, query: &ListQuery) -> Result<Vec<BlobMeta>, Stor
         out.push(tuple_to_meta(row?)?);
     }
     Ok(out)
+}
+
+/// Brings an existing database up to [`SCHEMA_VERSION`].
+///
+/// [`SCHEMA`] uses `CREATE TABLE IF NOT EXISTS`, so it cannot fix a `reports`
+/// table that already exists with the old `(sha256, reporter, created_at)` key,
+/// and SQLite cannot drop a constraint in place. Without this rebuild a
+/// deployed database would keep the old key and stay unbounded — the exact
+/// defect v1 fixes. The rebuild keeps the lowest `id` per `(sha256, reporter)`
+/// and drops the duplicates the old key allowed. It is one transaction, so a
+/// crash rolls back rather than leaving a half-renamed table, and
+/// `user_version` is stamped last so the rebuild never runs twice. A fresh
+/// database is already on the new key; its copy is empty but it is still
+/// stamped, so the guard holds.
+fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        r#"
+CREATE TABLE reports_migrated (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256     TEXT NOT NULL,
+    reporter   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (sha256, reporter)
+);
+INSERT OR IGNORE INTO reports_migrated (id, sha256, reporter, kind, content, created_at)
+    SELECT id, sha256, reporter, kind, content, created_at FROM reports ORDER BY id;
+DROP TABLE reports;
+ALTER TABLE reports_migrated RENAME TO reports;
+CREATE INDEX IF NOT EXISTS reports_sha256 ON reports (sha256);
+"#,
+    )?;
+    // Stamped from the constant rather than a literal in the SQL, so the guard
+    // above and the version written here cannot drift apart.
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn insert_report(conn: &mut Connection, report: &ReportRecord) -> Result<(), StoreError> {
@@ -2360,6 +2427,191 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn reports_dedupe_on_sha256_and_reporter_not_created_at() {
+        let (store, _dir) = open_store(1024).await;
+        let report = |created_at| ReportRecord {
+            hashes: vec![hash_of(HELLO_WORLD_HASH)],
+            reporter: pubkey(0x22),
+            kind: "malware".to_string(),
+            content: "bad blob".to_string(),
+            created_at,
+        };
+
+        // `created_at` is client-supplied, so distinct values must not buy the
+        // reporter extra rows: one report per reporter per blob.
+        store.save_report(report(1)).await.unwrap();
+        store.save_report(report(2)).await.unwrap();
+        store.save_report(report(3)).await.unwrap();
+
+        let count: i64 = store
+            .inner
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn report_with_no_hashes_is_rejected() {
+        let (store, _dir) = open_store(1024).await;
+
+        let err = store
+            .save_report(ReportRecord {
+                hashes: Vec::new(),
+                reporter: pubkey(0x22),
+                kind: "spam".to_string(),
+                content: "no hashes".to_string(),
+                created_at: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::EmptyReport));
+
+        let count: i64 = store
+            .inner
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_reporter_is_rejected() {
+        let (store, _dir) = open_store(1024).await;
+
+        for bad in [
+            "not-hex".to_string(),
+            "AB".repeat(32), // uppercase hex is not a valid pubkey
+            "a".repeat(63),  // too short
+        ] {
+            let err = store
+                .save_report(ReportRecord {
+                    hashes: vec![hash_of(HELLO_WORLD_HASH)],
+                    reporter: bad,
+                    kind: "spam".to_string(),
+                    content: "bad".to_string(),
+                    created_at: 1,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StoreError::InvalidReporter));
+        }
+
+        let count: i64 = store
+            .inner
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // The canonical lowercase form is accepted.
+        store
+            .save_report(ReportRecord {
+                hashes: vec![hash_of(HELLO_WORLD_HASH)],
+                reporter: pubkey(0x22),
+                kind: "spam".to_string(),
+                content: "bad".to_string(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn report_content_over_the_cap_is_rejected() {
+        let (store, _dir) = open_store(1024).await;
+        let report = |content: String| ReportRecord {
+            hashes: vec![hash_of(HELLO_WORLD_HASH)],
+            reporter: pubkey(0x22),
+            kind: "spam".to_string(),
+            content,
+            created_at: 1,
+        };
+
+        let err = store
+            .save_report(report("x".repeat(MAX_REPORT_CONTENT + 1)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::TooLarge));
+
+        let count: i64 = store
+            .inner
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Exactly the cap is still accepted.
+        store
+            .save_report(report("x".repeat(MAX_REPORT_CONTENT)))
+            .await
+            .unwrap();
+    }
+
+    /// Writes an `index.db` carrying the pre-fix `reports` key by hand, so a
+    /// test can prove `open` rebuilds it. Two rows share one
+    /// `(sha256, reporter)` at different `created_at`, the shape the old key
+    /// let a hostile reporter inflate.
+    fn write_legacy_reports_db(dir: &Path) {
+        let conn = Connection::open(dir.join("index.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE reports (\n    id         INTEGER PRIMARY KEY AUTOINCREMENT,\n    sha256     TEXT NOT NULL,\n    reporter   TEXT NOT NULL,\n    kind       TEXT NOT NULL,\n    content    TEXT NOT NULL,\n    created_at INTEGER NOT NULL,\n    UNIQUE (sha256, reporter, created_at)\n);\nCREATE INDEX reports_sha256 ON reports (sha256);\nINSERT INTO reports (sha256, reporter, kind, content, created_at) VALUES\n    ('aaaa', 'bbbb', 'malware', 'first', 1),\n    ('aaaa', 'bbbb', 'malware', 'second', 2);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_migrates_the_legacy_report_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy_reports_db(dir.path());
+        let store = FsBlobStore::open(StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+            max_total_bytes: None,
+        })
+        .await
+        .unwrap();
+
+        let conn = store.inner.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "duplicates the old key allowed must be dropped");
+        let content: String = conn
+            .query_row("SELECT content FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "first", "the lowest id must survive");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[tokio::test]
+    async fn open_is_idempotent_after_the_report_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy_reports_db(dir.path());
+        let config = || StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_blob_size: 1024,
+            max_total_bytes: None,
+        };
+
+        drop(FsBlobStore::open(config()).await.unwrap());
+        let store = FsBlobStore::open(config()).await.unwrap();
+
+        let conn = store.inner.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
     }
 
     #[tokio::test]
