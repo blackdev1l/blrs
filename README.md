@@ -89,17 +89,42 @@ build and test runs in a container via `./dcargo.sh`:
 The release profile is tuned for the Pi: thin LTO, one codegen unit,
 `panic = "abort"`, and stripped symbols.
 
-### Building the Raspberry Pi binary
+### Building the Raspberry Pi binaries
 
 ```sh
 ./scripts/build-pi.sh
 ```
 
-Produces `dist/blossom-aarch64`: an aarch64 Linux binary requiring **glibc >=
-2.31**, so it runs on Raspberry Pi OS bullseye and bookworm alike. It is built
+Produces two artifacts, because a 32-bit userland cannot run a 64-bit binary and
+DietPi is installed as either:
+
+| Artifact | Target | Runs on |
+| --- | --- | --- |
+| `dist/blossom-aarch64` | `aarch64-unknown-linux-gnu` | Pi 3/4/5, 64-bit OS (`arm64`) |
+| `dist/blossom-armv7` | `armv7-unknown-linux-gnueabihf` | Pi 2/3/4/5, 32-bit OS (`armv7l`) |
+
+Both need **glibc >= 2.31**, so they run on bullseye and bookworm. They are built
 from a bullseye base **deliberately** — the binary links against the build
 image's glibc, so building on a newer base would raise the floor and silently
-produce an artifact that fails to start on older hosts.
+produce artifacts that fail to start on older hosts. ARMv6 (Pi 1 / Zero) is not
+covered.
+
+### Deploying to the Pi
+
+```sh
+./scripts/deploy-pi.sh              # uses the `pi` ssh alias
+./scripts/deploy-pi.sh dietpi@host:8822
+```
+
+It asks the remote host for `uname -m`, picks the matching artifact, installs it
+to `/usr/local/bin/blossom` via a temp name plus `mv` so a dropped connection
+cannot leave a half-written binary in place, and then runs `--version` on the
+host to confirm the artifact actually executes.
+
+It deliberately does **not** use `scp`. OpenSSH 9.0+ implements `scp` on top of
+SFTP, so `scp` fails outright against a server with no SFTP subsystem even
+though `ssh` works. Piping over `ssh` needs only an ssh client at each end. If
+you want `scp` itself, `scp -O` forces the legacy protocol.
 
 ## Running
 
