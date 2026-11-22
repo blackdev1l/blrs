@@ -2,8 +2,8 @@
 # Build release binaries for Raspberry Pi and copy them to dist/.
 #
 # Two artifacts, because we cannot assume a 32-bit or a 64-bit userland:
-#   dist/blossom-aarch64   arm64 / aarch64  (Pi 3/4/5 on a 64-bit OS)
-#   dist/blossom-armv7     armv7l           (Pi 2/3/4/5 on a 32-bit OS)
+#   dist/blrs-aarch64      arm64 / aarch64  (Pi 3/4/5 on a 64-bit OS)
+#   dist/blrs-armv7        armv7l           (Pi 2/3/4/5 on a 32-bit OS)
 #
 # Both need glibc >= 2.31, so they run on Raspberry Pi OS / DietPi bullseye and
 # bookworm. ARMv6 (Pi 1 / Zero) is not covered.
@@ -40,14 +40,14 @@ build_one() {
   run_in_image cargo build --release --target "$target" -p blossom-http
   mkdir -p "$ROOT/dist"
   run_in_image bash -c \
-    "cp /work/target/$target/release/blossom /work/dist/$artifact && chmod +x /work/dist/$artifact"
+    "cp /work/target/$target/release/blrs /work/dist/$artifact && chmod +x /work/dist/$artifact"
   echo "build-pi: dist/$artifact" >&2
 }
 
-build_one aarch64-unknown-linux-gnu     blossom-aarch64
-build_one armv7-unknown-linux-gnueabihf blossom-armv7
+build_one aarch64-unknown-linux-gnu     blrs-aarch64
+build_one armv7-unknown-linux-gnueabihf blrs-armv7
 
 echo >&2
-for f in blossom-aarch64 blossom-armv7; do
+for f in blrs-aarch64 blrs-armv7; do
   printf '%-20s %s\n' "$f" "$(file -b "$ROOT/dist/$f" | cut -c1-72)" >&2
 done

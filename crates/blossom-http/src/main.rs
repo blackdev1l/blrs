@@ -4,7 +4,7 @@ async fn main() {
     // Rust format it with `Debug`, which surfaces as `Error: BadSize("4X")`
     // rather than the message the error type actually carries.
     if let Err(err) = blossom_http::run().await {
-        eprintln!("blossom: {err}");
+        eprintln!("blrs: {err}");
         std::process::exit(1);
     }
 }

@@ -8,11 +8,11 @@
 # Usage:
 #   ./scripts/deploy-pi.sh                 # uses the `pi` ssh alias
 #   ./scripts/deploy-pi.sh dietpi@host:8822
-#   ./scripts/deploy-pi.sh pi /usr/local/bin/blossom
+#   ./scripts/deploy-pi.sh pi /opt/blrs
 set -euo pipefail
 
 TARGET="${1:-pi}"
-DEST="${2:-/usr/local/bin/blossom}"
+DEST="${2:-/opt/blrs}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -W)"
 
 echo "deploy: asking $TARGET for its architecture" >&2
@@ -33,8 +33,8 @@ fi
 echo "deploy: remote is $MACHINE" >&2
 
 case "$MACHINE" in
-  aarch64|arm64) ARTIFACT=blossom-aarch64 ;;
-  armv7l|armv7)  ARTIFACT=blossom-armv7 ;;
+  aarch64|arm64) ARTIFACT=blrs-aarch64 ;;
+  armv7l|armv7)  ARTIFACT=blrs-armv7 ;;
   armv6l|armv6)
     echo "deploy: $MACHINE is ARMv6 (Pi 1 / Zero); no artifact is built for it." >&2
     echo "deploy: it would need arm-unknown-linux-gnueabihf plus a v6 cross gcc." >&2

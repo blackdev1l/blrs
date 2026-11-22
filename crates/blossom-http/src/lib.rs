@@ -56,7 +56,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let bound = listener.local_addr()?;
-    tracing::info!(address = %bound, "blossom server listening");
+    tracing::info!(address = %bound, "blrs server listening");
 
     let state = AppState::new(Arc::new(store), Arc::new(config), Arc::new(SystemClock));
     axum::serve(listener, router(state)).await?;

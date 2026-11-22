@@ -133,7 +133,7 @@ pub fn parse_max_total_size(raw: &str) -> Result<Option<u64>, ConfigError> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "blossom", about = "A Blossom blob server", version)]
+#[command(name = "blrs", about = "A Blossom blob server", version)]
 struct Cli {
     #[arg(long, env = "BLOSSOM_BIND", default_value = "0.0.0.0:3000")]
     bind: SocketAddr,
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn public_url_derives_base_and_host() {
-        let config = from_args(&["blossom", "--public-url", "HTTPS://CDN.Example.COM/"]).unwrap();
+        let config = from_args(&["blrs", "--public-url", "HTTPS://CDN.Example.COM/"]).unwrap();
         assert_eq!(config.public_base, "https://cdn.example.com");
         assert_eq!(config.host, "cdn.example.com");
     }
@@ -254,18 +254,18 @@ mod tests {
     #[test]
     fn public_url_keeps_a_path_without_a_trailing_slash() {
         let config =
-            from_args(&["blossom", "--public-url", "https://cdn.example.com/media/"]).unwrap();
+            from_args(&["blrs", "--public-url", "https://cdn.example.com/media/"]).unwrap();
         assert_eq!(config.public_base, "https://cdn.example.com/media");
     }
 
     #[test]
     fn public_url_rejects_non_http_schemes() {
         assert!(matches!(
-            from_args(&["blossom", "--public-url", "ftp://cdn.example.com"]),
+            from_args(&["blrs", "--public-url", "ftp://cdn.example.com"]),
             Err(ConfigError::BadPublicUrl(_))
         ));
         assert!(matches!(
-            from_args(&["blossom", "--public-url", "cdn.example.com:3000"]),
+            from_args(&["blrs", "--public-url", "cdn.example.com:3000"]),
             Err(ConfigError::BadPublicUrl(_))
         ));
     }
@@ -301,10 +301,10 @@ mod tests {
 
     #[test]
     fn max_total_size_flag_feeds_the_config() {
-        let config = from_args(&["blossom", "--max-total-size", "4GiB"]).unwrap();
+        let config = from_args(&["blrs", "--max-total-size", "4GiB"]).unwrap();
         assert_eq!(config.max_total_bytes, Some(4 * 1024 * 1024 * 1024));
 
-        let unlimited = from_args(&["blossom", "--max-total-size", "0"]).unwrap();
+        let unlimited = from_args(&["blrs", "--max-total-size", "0"]).unwrap();
         assert_eq!(unlimited.max_total_bytes, None);
     }
 }
