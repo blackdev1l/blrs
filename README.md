@@ -100,8 +100,8 @@ DietPi is installed as either:
 
 | Artifact | Target | Runs on |
 | --- | --- | --- |
-| `dist/blossom-aarch64` | `aarch64-unknown-linux-gnu` | Pi 3/4/5, 64-bit OS (`arm64`) |
-| `dist/blossom-armv7` | `armv7-unknown-linux-gnueabihf` | Pi 2/3/4/5, 32-bit OS (`armv7l`) |
+| `dist/blrs-aarch64` | `aarch64-unknown-linux-gnu` | Pi 3/4/5, 64-bit OS (`arm64`) |
+| `dist/blrs-armv7` | `armv7-unknown-linux-gnueabihf` | Pi 2/3/4/5, 32-bit OS (`armv7l`) |
 
 Both need **glibc >= 2.31**, so they run on bullseye and bookworm. They are built
 from a bullseye base **deliberately** — the binary links against the build
@@ -117,7 +117,7 @@ covered.
 ```
 
 It asks the remote host for `uname -m`, picks the matching artifact, installs it
-to `/usr/local/bin/blossom` via a temp name plus `mv` so a dropped connection
+to `/opt/blrs` via a temp name plus `mv` so a dropped connection
 cannot leave a half-written binary in place, and then runs `--version` on the
 host to confirm the artifact actually executes.
 
@@ -126,10 +126,22 @@ SFTP, so `scp` fails outright against a server with no SFTP subsystem even
 though `ssh` works. Piping over `ssh` needs only an ssh client at each end. If
 you want `scp` itself, `scp -O` forces the legacy protocol.
 
+### Releases
+
+`.github/workflows/release.yml` publishes a release on every push to `main`,
+tagged `v<version>-main.<run_number>` so each build is addressable and a re-run
+lands on the same tag. It ships three Linux tarballs
+(`blrs-<version>-<target>.tar.gz` for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, and `armv7-unknown-linux-gnueabihf`), a Windows zip
+(`blrs-<version>-x86_64-pc-windows-msvc.zip`, with `blrs.exe` at its root), and a
+`SHA256SUMS` file covering all of them. The Linux binaries are cross-built in a
+bullseye container; the Windows binary is built natively with MSVC on
+`windows-latest` and smoke-run before packaging.
+
 ## Running
 
 ```sh
-./blossom --data-dir /var/lib/blossom --public-url https://cdn.example.com
+./blrs --data-dir /var/lib/blrs --public-url https://cdn.example.com
 ```
 
 Configuration is available as CLI flags or `BLOSSOM_*` environment variables:
@@ -161,6 +173,22 @@ transaction, so concurrent uploads cannot between them exceed it. Exhaustion is
 space and is never refused, even at 100%.
 
 `--max-blob-size` and `--max-total-size` are independent; both apply.
+
+## Logging
+
+`RUST_LOG` controls the verbosity filter; without it the server defaults to
+`info`. At that level the log carries a startup line with the bound address, one
+request line per HTTP request — method, path, and the response status, including
+CORS preflights and unmatched routes — and a structured line for every
+successful write (`PUT /upload`, `PUT /media`, `PUT /mirror`, and
+`DELETE /<sha256>`) with the blob `sha256`, its byte `size`, the `owner` pubkey,
+and the `outcome` (`created`/`existed`/`deleted`), so an upload can be grepped by
+hash. Authorization failures log at `warn`, and storage errors at `warn` or
+`error`. The `Authorization` header and token contents are never logged.
+
+```sh
+RUST_LOG=blossom_http=debug ./blrs --data-dir ./data
+```
 
 ## Security notes
 

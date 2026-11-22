@@ -1,0 +1,207 @@
+# Verify, cross-build, and publish a release for every architecture this server
+# targets.
+#
+# Every Linux build runs inside `rust:1-bullseye` rather than on the runner's
+# own toolchain, for the same reason docker/Dockerfile.pi does: the binary links
+# against the *build* image's glibc, so a newer base raises the floor and
+# produces artifacts that fail to start on older bullseye hosts.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialised per ref, and never cancelled: a run that already published some
+# artifacts must not be killed halfway through its own release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    container: rust:1-bullseye
+    steps:
+      - uses: actions/checkout@v4
+
+      # The upstream image ships without clippy, which is a documented gate.
+      # rustfmt is deliberately not installed: it is not one.
+      - name: install clippy
+        run: rustup component add clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ubuntu-latest
+    container: rust:1-bullseye
+    strategy:
+      # One architecture that fails to build must not withdraw the artifacts of
+      # the others, since a partial release is still better than none.
+      fail-fast: false
+      matrix:
+        include:
+          # amd64 servers need no cross toolchain at all.
+          - target: x86_64-unknown-linux-gnu
+            apt: ''
+          # 64-bit Pi / arm64 servers.
+          - target: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          # 32-bit Pi (Pi 2 and up; ARMv6 is not covered).
+          - target: armv7-unknown-linux-gnueabihf
+            apt: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+    env:
+      # Mirrors docker/Dockerfile.pi. rusqlite's bundled SQLite and
+      # secp256k1-sys both compile C, so CC and AR must point at the cross
+      # toolchain, not just the Rust linker. Each variable is only read when its
+      # own target is the one being built, so carrying all of them in every
+      # matrix job is inert for the targets that do not use them.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+      AR_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-ar
+      # Rust's armv7 target defaults to a conservative feature set; the Pi 2 and
+      # up are Cortex-A7 or better, so enable v7 explicitly rather than shipping
+      # a v6 binary. Same reason as docker/Dockerfile.pi.
+      CFLAGS_armv7_unknown_linux_gnueabihf: -march=armv7-a
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install cross toolchain
+        if: matrix.apt != ''
+        env:
+          CROSS_PACKAGES: ${{ matrix.apt }}
+        run: |
+          apt-get update
+          # Word splitting is intended: one env var holds several package names.
+          read -r -a packages <<< "$CROSS_PACKAGES"
+          apt-get install -y --no-install-recommends "${packages[@]}"
+          rm -rf /var/lib/apt/lists/*
+
+      - name: add target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The host triple is the same in every matrix job, so without this the
+          # builds would evict each other's caches.
+          key: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p blossom-http
+
+      # Only the amd64 binary can run inside this x86_64 container; the arm
+      # targets cannot execute here. Running `--version` proves the artifact
+      # starts, the same check scripts/deploy-pi.sh makes on the Pi.
+      - name: smoke-run
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: target/${{ matrix.target }}/release/blrs --version
+
+      - name: package
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          archive="blrs-${version}-${{ matrix.target }}.tar.gz"
+          # The crate is `blossom-http` but the binary is `blrs`. Stage it
+          # outside the checkout so the tarball holds that binary at its root
+          # and nothing else.
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/blrs" "$staging/blrs"
+          chmod +x "$staging/blrs"
+          mkdir -p dist
+          tar -czf "dist/${archive}" -C "$staging" blrs
+          echo "built dist/${archive}"
+          tar -tzf "dist/${archive}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blrs-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: build x86_64-pc-windows-msvc
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSVC cannot build inside the Linux container, so this job runs on the
+      # native Windows runner instead.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p blossom-http
+
+      # Runs natively on the runner, so it proves the artifact executes — the
+      # same philosophy as scripts/deploy-pi.sh's `--version` check on the Pi.
+      - name: smoke-run
+        run: target/x86_64-pc-windows-msvc/release/blrs.exe --version
+
+      - name: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # blrs.exe must sit at the zip root, so archive the file directly.
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/blrs.exe `
+            -DestinationPath "dist/blrs-$version-x86_64-pc-windows-msvc.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blrs-x86_64-pc-windows-msvc
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [build, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: ( cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS )
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          # The run number makes every main build addressable without ever
+          # moving a tag, and a re-run of the same workflow lands on the same
+          # tag instead of colliding with it.
+          tag="v${version}-main.${{ github.run_number }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-run: replace the assets in place rather than failing.
+            gh release upload "$tag" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+              --target "${{ github.sha }}" \
+              --generate-notes
+          fi
